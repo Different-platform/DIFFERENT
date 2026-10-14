@@ -20,6 +20,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 from services.api.api.routes import chat, health, variables, years
 from services.api.config import settings
+from services.api.middleware.rate_limit import RateLimiter, RateLimitMiddleware
 from services.api.middleware.timing import TimingMiddleware
 from services.api.orchestrator import Orchestrator
 from services.api.store import db
@@ -82,16 +83,37 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Order matters: timing wraps everything so its measurement includes the rest.
-app.add_middleware(TimingMiddleware)
+rate_limiter = RateLimiter(
+    limit=settings.rate_limit_max,
+    window_seconds=settings.rate_limit_window_seconds,
+)
+
+# Starlette applies middleware in reverse registration order, so the last
+# registered runs outermost. Timing is registered last to wrap everything,
+# and rate limiting sits ahead of the orchestrator so a rejected request
+# costs no provider quota (Requirement 18.2).
+app.add_middleware(
+    RateLimitMiddleware,
+    limiter=rate_limiter,
+    protected_paths=("/api/chat",),
+)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(TimingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
-    expose_headers=["X-Request-ID", "X-Response-Time-Ms"],
+    # The browser cannot read these unless they are explicitly exposed, and
+    # the UI's rate-limit indicator depends on them.
+    expose_headers=[
+        "X-Request-ID",
+        "X-Response-Time-Ms",
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+    ],
 )
 
 app.include_router(health.router)
