@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+.env.local
+
+# Ingestion caches and model weights
+.cache/
+models/
+
+# OS
+.DS_Store
+
+# Data — NHIS source files are never committed (see NHIS_DATA_DIR in .env.example)
+data/
+*.csv
+*.pdf
