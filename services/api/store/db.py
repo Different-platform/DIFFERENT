@@ -80,3 +80,10 @@ def database_reachable() -> bool:
             return True
     except psycopg.OperationalError:
         return False
+
+
+async def run_db_safe() -> bool:
+    """Non-raising reachability probe for the health endpoint."""
+    import asyncio
+
+    return await asyncio.to_thread(database_reachable)

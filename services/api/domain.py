@@ -99,3 +99,9 @@ class SectionHit:
     survey_year: int
     similarity: float
     n_variables: int | None = None
+
+
+#: Years the platform covers (Requirement 10.1). Used to validate requests.
+SURVEY_YEARS_MIN = 2017
+SURVEY_YEARS_MAX = 2023
+SURVEY_YEARS: tuple[int, ...] = tuple(range(SURVEY_YEARS_MIN, SURVEY_YEARS_MAX + 1))
