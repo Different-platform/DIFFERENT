@@ -33,7 +33,15 @@ _DATA_PATTERNS = re.compile(
     r"how many|count|distribution|crosstab|cross-tab|compare|trend)\w*", re.I
 )
 
-_VARIABLE_TOKEN = re.compile(r"\b([A-Z][A-Z0-9]{2,}(?:_[A-Z])?)\b")
+#: Matches both context formats: the generate stage emits "VARNAME - desc"
+#: while the judge stage numbers its candidates as "1. VARNAME - desc".
+#: Anchored on that format rather than a loose upper-case scan over the
+#: whole prompt, which also matched prose words such as "NOT" in
+#: "NHIS does NOT measure ..." (a regression caught twice already).
+_CONTEXT_VARIABLE = re.compile(r"^(?:\d+\.\s*)?([A-Z][A-Z0-9_]{2,}) - ", re.M)
+
+#: Verdict handed to the generate stage, so wording can respect it.
+_PRESENCE_CHECK = re.compile(r"^Presence check:\s*(MEASURED|RELATED|ABSENT)", re.M)
 
 
 def _user_text(messages: list[Message]) -> str:
@@ -48,15 +56,18 @@ def _question_from(messages: list[Message]) -> str:
 
 
 def _candidate_variables(messages: list[Message], limit: int = 3) -> list[str]:
-    """Variable names appearing in the retrieved context block."""
+    """Variable names from the retrieved context block, in rank order."""
     text = _user_text(messages)
     seen: list[str] = []
-    for token in _VARIABLE_TOKEN.findall(text):
-        if token in {"MEASURED", "RELATED", "ABSENT", "NHIS", "SQL"}:
-            continue
+    for token in _CONTEXT_VARIABLE.findall(text):
         if token not in seen:
             seen.append(token)
     return seen[:limit]
+
+
+def _presence_verdict(messages: list[Message]) -> str:
+    match = _PRESENCE_CHECK.search(_user_text(messages))
+    return match.group(1) if match else "MEASURED"
 
 
 def _rewrite(messages: list[Message]) -> str:
@@ -112,8 +123,16 @@ def _judge(messages: list[Message]) -> str:
 
 
 def _generate(messages: list[Message]) -> str:
-    question = _question_from(messages)
+    """Compose wording that respects the verdict it was given.
+
+    The verdict must drive the phrasing. Saying "NHIS measures this with X"
+    under a RELATED verdict asserts an equivalence the judge explicitly
+    declined to make, which is the exact misreading the RELATED verdict
+    exists to prevent.
+    """
     variables = _candidate_variables(messages, limit=3)
+    verdict = _presence_verdict(messages)
+    year = _year_from(messages)
 
     if not variables:
         return (
@@ -124,9 +143,31 @@ def _generate(messages: list[Message]) -> str:
     primary = variables[0]
     others = variables[1:]
 
+    if verdict == "ABSENT":
+        return (
+            "Not measured in NHIS. The retrieved variables are topically "
+            "adjacent at best and none of them records this concept, so there "
+            "is nothing here to report."
+        )
+
+    if verdict == "RELATED":
+        sentences = [
+            f"NHIS does not measure this directly. The closest variable in "
+            f"the {year} Sample Adult codebook is {primary}, which captures a "
+            f"related but distinct construct.",
+            "Treat it as a proxy rather than an equivalent measure, and check "
+            "the survey question and response options on the citation before "
+            "using it.",
+        ]
+        if others:
+            sentences.insert(
+                1, "Other nearby variables include " + ", ".join(others) + "."
+            )
+        return " ".join(sentences)
+
     sentences = [
-        f"NHIS measures this with {primary}, according to the "
-        f"{_year_from(messages)} Sample Adult codebook."
+        f"NHIS measures this with {primary}, according to the {year} Sample "
+        f"Adult codebook."
     ]
     if others:
         sentences.append(
@@ -138,7 +179,6 @@ def _generate(messages: list[Message]) -> str:
         "See the citations below for the exact codebook page and the "
         "response options recorded for each variable."
     )
-    del question
     return " ".join(sentences)
 
 
