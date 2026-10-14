@@ -87,6 +87,14 @@ _ROW_CODE_ONLY = re.compile(r"^(?P<code>\S+)\s{2,}(?P<label>.+?)\s*$")
 
 _SECTION = re.compile(r"^(?P<code>\S+)\s*:\s*(?P<name>.+)$")
 
+# Some variables are coded as a span rather than discrete values, e.g.
+#   SRVY_YR    "1963-current  Survey year"
+#   IMPNUM_A   "01-10         Imputation number"
+# These have no discrete codes to verify SQL against, so they are treated the
+# same as a "Range of values" row: the variable is marked continuous and no
+# bogus value label is stored. Discrete codes never contain a hyphen.
+_CODE_RANGE = re.compile(r"^\d[\w]*\s*[-\u2013]\s*\S+$")
+
 _VARIABLE_INFO_MARKER = "Variable Information:"
 _FREQUENCIES_MARKER = "Unweighted frequencies:"
 
@@ -157,6 +165,11 @@ def parse_value_label_rows(text: str) -> tuple[list[tuple[Decimal, str, int | No
         if _PAGE_FOOTER.match(line):
             break
         if is_range_of_values(stripped):
+            continuous = True
+            continue
+
+        leading = stripped.split(maxsplit=1)[0] if stripped.split() else ""
+        if _CODE_RANGE.match(leading):
             continuous = True
             continue
 
