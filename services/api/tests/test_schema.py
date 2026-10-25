@@ -159,3 +159,21 @@ def test_source_era_rejects_unknown_value(db_conn):
                 VALUES (2023, '_TEST_ERA', 'test', 1, 'not_a_real_era')
                 """
             )
+
+
+def test_retrieval_excludes_design_variables(db_conn):
+    """Weights, design vars, and record ids must never be retrieval candidates.
+
+    A researcher never asks "does NHIS measure WTFA_A?"; surfacing the weight
+    as a candidate flips the presence judge and makes the weight the headline
+    "measure". The exclusion is enforced in the search SQL, so a plain query
+    (here with a zero vector, no embedder needed) must return none of them.
+    """
+    from services.api.store import vector_store
+
+    hits = vector_store.search_variables(
+        db_conn, [0.0] * 768, survey_year=2023, limit=50
+    )
+    names = {h.variable_name for h in hits}
+    leaked = names & set(vector_store.NON_SUBSTANTIVE_VARIABLES)
+    assert leaked == set(), f"design variables leaked into retrieval: {leaked}"

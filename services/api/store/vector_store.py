@@ -19,6 +19,27 @@ def _to_pgvector(vector: list[float]) -> str:
     return "[" + ",".join(repr(float(c)) for c in vector) + "]"
 
 
+# Structural / design variables that are never a research concept: survey
+# weights, design variables, and record identifiers. They must not surface as
+# retrieval candidates — a researcher never asks "does NHIS measure WTFA_A?",
+# and when a question contains "weighted" or "average" the weight variable
+# otherwise ranks top, flipping the presence judge to RELATED and making the
+# weight itself the headline "measure". They remain usable in generated SQL
+# (the generator is told about WTFA_A explicitly); this only removes them from
+# the retrieval/judge candidate set.
+NON_SUBSTANTIVE_VARIABLES: tuple[str, ...] = (
+    "WTFA_A",
+    "WTIA_A",
+    "WTFA_SA",
+    "WTIA_SA",
+    "PSTRAT",
+    "PPSU",
+    "HHX",
+    "RECTYPE",
+    "SRVY_YR",
+)
+
+
 # 1 - cosine_distance gives cosine similarity, which is what the UI shows.
 _SEARCH_VARIABLES = """
 SELECT
@@ -40,6 +61,7 @@ SELECT
 FROM codebook_variables
 WHERE embedding IS NOT NULL
   AND (%(survey_year)s::int IS NULL OR survey_year = %(survey_year)s::int)
+  AND NOT (variable_name = ANY(%(exclude)s))
 ORDER BY embedding <=> %(query)s::vector
 LIMIT %(limit)s
 """
@@ -80,7 +102,12 @@ def search_variables(
     generated codes against them.
     """
     vector = _to_pgvector(query_vector)
-    params = {"query": vector, "survey_year": survey_year, "limit": limit}
+    params = {
+        "query": vector,
+        "survey_year": survey_year,
+        "limit": limit,
+        "exclude": list(NON_SUBSTANTIVE_VARIABLES),
+    }
 
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(_SEARCH_VARIABLES, params)
