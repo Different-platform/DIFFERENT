@@ -109,7 +109,16 @@ def _printed_page_number(text: str) -> int | None:
 
 
 def parse_fields(text: str) -> dict[str, str]:
-    """Extract the labelled field block, joining wrapped continuation lines."""
+    """Extract the labelled field block, joining wrapped continuation lines.
+
+    Capturing starts at the "Variable Information:" marker when the codebook
+    prints one (confirmed present only in the 2023 adult codebook), or
+    otherwise at the "Variable:" field itself, which every redesign-era
+    codebook prints as the first field on a variable's page. Requiring the
+    marker unconditionally made every page in the 2019-2022 adult codebooks
+    parse to zero fields, silently — those PDFs go straight to "Variable:"
+    with no preceding marker line.
+    """
     fields: dict[str, str] = {}
     current: str | None = None
     started = False
@@ -121,7 +130,13 @@ def parse_fields(text: str) -> dict[str, str]:
         if not started:
             if stripped == _VARIABLE_INFO_MARKER:
                 started = True
-            continue
+                continue
+            match = _FIELD_START.match(stripped)
+            if match and match.group("label") == "Variable":
+                started = True
+                # Fall through: this line is itself the first field to record.
+            else:
+                continue
 
         if stripped.startswith(_FREQUENCIES_MARKER):
             break
@@ -222,6 +237,14 @@ def _build_variable(
         if match:
             section_code = match.group("code").strip()
             section_name = match.group("name").strip()
+        elif " " not in raw_section.strip():
+            # The 2019 adult codebook prints only the bare section code
+            # ("UCF", "GEN") with no "code : name" form at all, unlike every
+            # other redesign-era year. Using the code as its own name keeps
+            # section_code non-null — leaving it null silently dropped every
+            # 2019 variable out of the sections table (0 of 76+ expected).
+            section_code = raw_section.strip()
+            section_name = raw_section.strip()
         else:
             section_name = raw_section.strip()
 
