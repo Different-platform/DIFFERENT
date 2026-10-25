@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # Empty means the app falls back to FakeLLMGateway, which returns
     # scripted responses. Everything downstream of the gateway still runs.
     groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-120b"
 
     # --- Embeddings ---
     # Must be identical between ingestion and query time (Req 13.3).

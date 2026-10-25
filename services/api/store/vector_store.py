@@ -235,6 +235,18 @@ def search_variables_by_text(
         return [dict(row) for row in cur.fetchall()]
 
 
+def survey_table_exists(conn: psycopg.Connection, survey_year: int) -> bool:
+    """Whether the microdata table for a year has been ingested.
+
+    The verified-statistics path can only run against a loaded year; the
+    orchestrator checks this before attempting SQL generation so an un-loaded
+    year yields an honest limitation rather than a failed query.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (f"public.survey_{survey_year}",))
+        return cur.fetchone()[0] is not None
+
+
 def available_years(conn: psycopg.Connection) -> list[dict]:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(

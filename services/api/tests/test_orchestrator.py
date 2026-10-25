@@ -13,15 +13,17 @@ from uuid import UUID
 import pytest
 
 from services.api import orchestrator as orch
-from services.api.domain import Hit
+from services.api.domain import Hit, ValueLabel
 from services.api.llm.gateway import FakeLLMGateway
-from services.api.rag import generate, judge, retrieval, router, rewrite
-from services.api.store import relational_store, vector_store
+from services.api.rag import generate, judge, retrieval, router, rewrite, sql_gen
+from services.api.store import readonly_store, relational_store, vector_store
 
 CONVERSATION_UUID = UUID("11111111-1111-1111-1111-111111111111")
 
 
 def make_hit(name: str, similarity: float = 0.6, page: int = 10) -> Hit:
+    from decimal import Decimal
+
     return Hit(
         variable_name=name,
         survey_year=2023,
@@ -31,6 +33,11 @@ def make_hit(name: str, similarity: float = 0.6, page: int = 10) -> Hit:
         section_name="Food Security",
         description=f"description of {name}",
         question_text=f"question for {name}",
+        value_labels=[
+            ValueLabel(code=Decimal(1), label="Yes", is_sentinel=False),
+            ValueLabel(code=Decimal(2), label="No", is_sentinel=False),
+            ValueLabel(code=Decimal(7), label="Refused", is_sentinel=True),
+        ],
     )
 
 
@@ -51,6 +58,9 @@ def pipeline(monkeypatch):
         "verdict": "MEASURED",
         "hits": hits,
         "logged": [],
+        "survey_table_exists": False,
+        "sql_result": None,
+        "generated_sql": "SELECT 1",
     }
 
     async def fake_run_db(operation, *args, **kwargs):
@@ -63,6 +73,11 @@ def pipeline(monkeypatch):
         if operation is vector_store.search_variables:
             order.append("retrieve")
             return list(state["hits"])
+        if operation is vector_store.survey_table_exists:
+            return state["survey_table_exists"]
+        if operation is readonly_store.execute:
+            order.append("execute")
+            return state["sql_result"]
         if operation is relational_store.write_query_log:
             order.append("log")
             state["logged"].append(kwargs)
@@ -96,12 +111,18 @@ def pipeline(monkeypatch):
         for token in ["Answer ", "about ", "FDSCAT4_A."]:
             yield token
 
+    async def fake_sql_gen(question, survey_year, hits_arg, *, gateway):
+        del question, survey_year, hits_arg, gateway
+        order.append("sql_gen")
+        return state["generated_sql"]
+
     monkeypatch.setattr(orch.db, "run_db", fake_run_db)
     monkeypatch.setattr(rewrite, "to_standalone", fake_rewrite)
     monkeypatch.setattr(router, "classify", fake_route)
     monkeypatch.setattr(retrieval, "embed_question", fake_embed)
     monkeypatch.setattr(judge, "classify_presence", fake_judge)
     monkeypatch.setattr(generate, "compose", fake_compose)
+    monkeypatch.setattr(sql_gen, "generate", fake_sql_gen)
 
     return {"order": order, "state": state}
 
@@ -203,17 +224,75 @@ async def test_property_3_related_carries_exactly_the_top_candidate(pipeline):
     assert citations[0]["variable_name"] == "FDSCAT4_A"
 
 
-async def test_data_intent_returns_no_number(pipeline):
-    """The verified-statistics path is deferred; it must not fabricate a figure."""
+async def test_data_intent_without_loaded_microdata_returns_no_number(pipeline):
+    """When the survey_YYYY table is absent, no number — an honest limitation."""
     pipeline["state"]["intent"] = "data"
     pipeline["state"]["verdict"] = "MEASURED"
+    pipeline["state"]["survey_table_exists"] = False
 
     events = await run(pipeline, "What is the average BMI?")
     event_types = types_of(events)
 
     assert "result" not in event_types
     assert "sql" not in event_types
-    assert "cannot produce yet" in answer_of(events)
+    assert "not loaded" in answer_of(events)
+
+
+async def test_data_intent_with_failed_verification_shows_sql_but_no_number(pipeline):
+    """Feature: differ-platform, Property 5: Verification gates numeric output.
+
+    An invented code must produce a `sql` event tagged verified:false, a prose
+    warning, and crucially NO `result` event and NO execution.
+    """
+    pipeline["state"]["intent"] = "data"
+    pipeline["state"]["verdict"] = "MEASURED"
+    pipeline["state"]["survey_table_exists"] = True
+    # Code 99 is not defined on the fixture variable (only 1, 2, 7 are).
+    pipeline["state"]["generated_sql"] = (
+        "SELECT FDSCAT4_A, WTFA_A FROM survey_2023 WHERE FDSCAT4_A NOT IN (99)"
+    )
+
+    events = await run(pipeline, "What share are food insecure?")
+    event_types = types_of(events)
+    order = pipeline["order"]
+
+    sql_event = next(e for e in events if e["type"] == "sql")
+    assert sql_event["sql"]["verified"] is False
+    assert sql_event["sql"]["problems"]
+    assert "result" not in event_types
+    assert "execute" not in order  # never executed
+    assert "did not pass verification" in answer_of(events)
+    assert pipeline["state"]["logged"][0]["sql_verified"] is False
+
+
+async def test_data_intent_with_verified_sql_returns_a_result(pipeline):
+    """Feature: differ-platform, Property 5: Verification gates numeric output.
+
+    When the generated SQL references only defined codes and executes, a
+    `result` event is emitted — this is the one path that yields a number.
+    """
+    pipeline["state"]["intent"] = "data"
+    pipeline["state"]["verdict"] = "MEASURED"
+    pipeline["state"]["survey_table_exists"] = True
+    pipeline["state"]["generated_sql"] = (
+        "SELECT FDSCAT4_A, WTFA_A FROM survey_2023 WHERE FDSCAT4_A IN (1, 2)"
+    )
+    pipeline["state"]["sql_result"] = readonly_store.SqlResult(
+        columns=["fdscat4_a", "wtfa_a"], rows=[[1, 1234.5], [2, 987.0]]
+    )
+
+    events = await run(pipeline, "What share are food insecure?")
+    event_types = types_of(events)
+    order = pipeline["order"]
+
+    sql_event = next(e for e in events if e["type"] == "sql")
+    assert sql_event["sql"]["verified"] is True
+    result_event = next(e for e in events if e["type"] == "result")
+    assert result_event["result"]["columns"] == ["fdscat4_a", "wtfa_a"]
+    assert result_event["result"]["weight_variable"] == "WTFA_A"
+    assert event_types.index("sql") < event_types.index("result")
+    assert "sql_gen" in order and "execute" in order
+    assert pipeline["state"]["logged"][0]["sql_verified"] is True
 
 
 # ---------------------------------------------------------------------------

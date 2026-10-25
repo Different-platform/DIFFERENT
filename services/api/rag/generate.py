@@ -179,21 +179,80 @@ def not_measured_message(question: str, why: str) -> str:
 
 
 def statistics_unavailable_message(hits: list[Hit]) -> str:
-    """Honest response when a question wants a number this version cannot compute.
+    """Honest response when the survey microdata for a year is not loaded.
 
-    SQL generation, verification, and the weighted-statistics engine are a
-    later phase. Returning a clear limitation is the only acceptable
-    behaviour — the alternative is an unverified number, which is precisely
-    what this product exists to prevent.
+    The verified-statistics path exists, but it can only run against a year
+    whose `survey_YYYY` table has been ingested. When it has not, the correct
+    behaviour is the same as any other missing-number case: say so, offer the
+    codebook explanation, and return no figure.
     """
     names = ", ".join(hit.variable_name for hit in hits[:2])
     suffix = f" The relevant variables appear to be {names}." if names else ""
     return (
-        "This question asks for a computed statistic, which this version "
-        "cannot produce yet — generated SQL is not verified against the "
-        "codebook until a later phase, and an unverified number is worse "
-        f"than none.{suffix} I can explain what the variables measure in the "
-        "meantime."
+        "This question asks for a computed statistic, but the survey microdata "
+        "for this year is not loaded, so there is nothing to compute against "
+        f"and I will not show an unverified number.{suffix} I can explain what "
+        "the variables measure in the meantime."
+    )
+
+
+def verification_failed_message(problems: list) -> str:
+    """Answer when generated SQL fails verification (Requirement 6.2, 6.3).
+
+    No number is shown. The SQL is still returned in a separate `sql` event
+    tagged `verified: false`; this is the prose that accompanies it, naming
+    what was wrong so a researcher can see *why* no figure appears rather than
+    being left to wonder.
+    """
+    reasons = [getattr(p, "message", str(p)) for p in problems][:3]
+    joined = (
+        " ".join(reasons) if reasons else "The generated query could not be verified."
+    )
+    return (
+        "I generated a query for this but it did not pass verification against "
+        f"the codebook, so I am not showing a number. {joined} The query is "
+        "shown above for transparency, marked unverified."
+    )
+
+
+def execution_failed_message() -> str:
+    """Answer when verified SQL nonetheless fails to execute under differ_ro.
+
+    This should be unreachable if the verifier is correct; it is the backstop
+    message for the defense-in-depth case, and it still yields no number.
+    """
+    return (
+        "The query passed verification but could not be executed safely, so no "
+        "number is shown. This is a safeguard: a result is only returned when "
+        "both verification and read-only execution succeed."
+    )
+
+
+def statistics_answer_message(
+    hits: list[Hit], columns: list[str], rows: list, weight_variable: str
+) -> str:
+    """Short prose accompanying a successfully computed, verified result.
+
+    Deliberately factual and brief — the table and the SQL carry the detail.
+    The one thing worth stating in words is that the figure is population-
+    weighted, since an unweighted NHIS number is a common and invisible error.
+    """
+    # The headline variable is the measure, not the weight or a design column
+    # that happened to rank highly in retrieval.
+    skip = {weight_variable.upper(), "WTFA_A", "WTFA_SA", "PSTRAT", "PPSU"}
+    measure = next(
+        (h.variable_name for h in hits if h.variable_name.upper() not in skip),
+        hits[0].variable_name if hits else "the measure",
+    )
+    value_hint = ""
+    if columns and rows and len(rows) == 1 and len(rows[0]) == 1:
+        value_hint = f" The computed value is {rows[0][0]}."
+    return (
+        f"The result below is computed from the NHIS survey microdata, weighted "
+        f"by {weight_variable} so it estimates the US population rather than the "
+        f"sample.{value_hint} It passed verification against the codebook before "
+        f"running, and the exact query is shown above. The primary variable is "
+        f"{measure}."
     )
 
 
