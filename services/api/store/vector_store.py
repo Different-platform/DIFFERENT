@@ -247,6 +247,27 @@ def survey_table_exists(conn: psycopg.Connection, survey_year: int) -> bool:
         return cur.fetchone()[0] is not None
 
 
+def loaded_survey_years(conn: psycopg.Connection) -> list[int]:
+    """Which years have a `survey_YYYY` microdata table loaded.
+
+    Distinct from `available_years`, which reports *codebook* coverage. A year
+    can have its codebook indexed (so Q&A works) without its microdata loaded
+    (so verified statistics do not). Surfacing this on /api/health lets an
+    operator see at a glance which years can answer a `data` question.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT regexp_replace(table_name, '^survey_', '')::int AS year
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name ~ '^survey_[0-9]+$'
+            ORDER BY year
+            """
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
 def available_years(conn: psycopg.Connection) -> list[dict]:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
