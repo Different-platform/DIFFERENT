@@ -1218,3 +1218,75 @@ config layout, the CI workflow layout, and the pydantic settings pattern. **Attr
 which is authoritative over the two architecture drafts, which are historical. Nothing in §11
 should be built. The four mechanisms in §8 must never be simplified away. The discrepancies in §12
 are known and unresolved — flag them rather than silently picking a side.
+
+---
+
+## Build status — updated during the verified-statistics + ingestion work
+
+This section supersedes the "Current state of the codebase" snapshot in §4, which
+described an earlier point when only the frontend template existed. The backend
+is now substantially built and runs end-to-end against a live Supabase instance
+with a real Groq LLM.
+
+### What works end-to-end
+
+- **Codebook Q&A** for survey years 2019–2023: retrieval → presence judge
+  (MEASURED / RELATED / ABSENT) → grounded answer with citations (variable,
+  section, page, year). Verified live, including honest ABSENT refusals.
+- **Verified descriptive statistics** for 2019–2023: SQL generation with real
+  codes injected → pure verifier against stored value labels → execution under
+  the `differ_ro` read-only role → population-weighted result. Verified live:
+  "average age of adults" returns 48.10 (2023) / 48.12 (2021), matching an
+  independent in-database calculation exactly. A failed verification shows the
+  SQL tagged `verified: false` and returns no number.
+
+### Data loaded in Supabase
+
+- Codebook + value labels (with per-variable sentinels): 2019, 2020, 2021,
+  2022, 2023. `HISPALLP_A` code 7 confirmed non-sentinel; 97/98/99 sentinel.
+- Survey microdata tables `survey_2019`..`survey_2023` (31,997 / 31,568 /
+  29,482 / 27,651 / 29,522 rows), readable through `differ_ro`.
+- Migrations applied: `001_codebook.sql`, `002_telemetry.sql`,
+  `003_differ_ro.sql`.
+
+### Components done (maps to tasks.md)
+
+Scaffolding (1); schema + telemetry + read-only-role migrations (2, minus
+`legacy_crosswalk`); 2019+ codebook ingestion + abort guard + sentinels (4);
+LLM gateway (7); RAG pipeline — rewrite/route/retrieve/judge/generate (8); SQL
+gen + verifier + analysis engine + read-only execution (10); orchestrator fixed
+pipeline (11); telemetry + timing (12); rate limiting (13); API routes (15);
+local docker-compose (20.1). 140 tests pass, including the safety-critical
+property tests (P4 weighted stats, P5 verification-gates-output, P6 verifier,
+P7 sentinel independence) and live `differ_ro` write-rejection integration tests.
+
+### Not yet done
+
+- Legacy **2017–2018 parser track + crosswalk** (tasks 2.2, 5). Those two years
+  have a different codebook/CSV layout and are not loaded (codebook or survey).
+  This is the largest remaining ingestion gap.
+- **Next.js frontend + secrets-hiding proxy** (task 16). Still the Vite SPA; the
+  §12.1 discrepancy is unresolved.
+- Eval harness (18), remaining CI static checks (7.5, 11.4, 12.2/12.4, 16.6, 19),
+  Railway/Vercel deploy config (20.2–20.4).
+
+### Deliberate deviations from design.md (all defensible)
+
+- `differ_ro` is a **NOLOGIN role entered via `SET LOCAL ROLE`** inside a
+  read-only transaction, rather than a second login role with its own pool. The
+  privilege boundary is identical and is proven by the write-rejection tests;
+  this avoids a second credential on managed Supabase.
+- **`survey_YYYY` tables are built at load time** from each CSV header (column
+  types inferred), not from a static migration, because each year has a
+  different ~530–647 column set.
+- The LLM is **`openai/gpt-oss-120b`** — `llama-3.3-70b-versatile` was
+  decommissioned by Groq and returns 404.
+- Ingestion reads a local **`NHIS_DATA_DIR`**, not Google Drive.
+
+### Operational notes
+
+- `.env` lives at the repo root, is gitignored, and holds live Supabase + Groq
+  credentials — rotate them before any wider sharing.
+- `/api/health` reports both `ingested_years` (codebook coverage) and
+  `survey_years_loaded` (microdata coverage); the latter is the set of years a
+  verified-statistics question can answer.
