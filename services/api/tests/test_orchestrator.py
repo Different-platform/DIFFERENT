@@ -51,6 +51,7 @@ class FakeEmbedder:
 def pipeline(monkeypatch):
     """Patch the DB and every stage, recording the order stages are entered."""
     order: list[str] = []
+    db_ops: list[str] = []  # kept apart from `order`, which Property 10 pins
     hits = [make_hit("FDSCAT4_A", 0.62), make_hit("FDSRUNOUT_A", 0.55)]
 
     state = {
@@ -61,20 +62,31 @@ def pipeline(monkeypatch):
         "survey_table_exists": False,
         "sql_result": None,
         "generated_sql": "SELECT 1",
+        "searched_year": "unset",
+        "fetched": [],
+        "fetchable": {},
+        "sql_gen_hits": None,
     }
 
     async def fake_run_db(operation, *args, **kwargs):
         if operation is relational_store.ensure_conversation:
             return CONVERSATION_UUID
         if operation is relational_store.insert_message:
+            db_ops.append(f"insert_{kwargs.get('role')}")
             return 42
         if operation is relational_store.load_history:
+            db_ops.append("load_history")
             return []
         if operation is vector_store.search_variables:
             order.append("retrieve")
+            state["searched_year"] = kwargs.get("survey_year")
             return list(state["hits"])
         if operation is vector_store.survey_table_exists:
             return state["survey_table_exists"]
+        if operation is vector_store.get_variable:
+            name = args[1]
+            state["fetched"].append(name)
+            return state["fetchable"].get(name)
         if operation is readonly_store.execute:
             order.append("execute")
             return state["sql_result"]
@@ -111,8 +123,9 @@ def pipeline(monkeypatch):
         for token in ["Answer ", "about ", "FDSCAT4_A."]:
             yield token
 
-    async def fake_sql_gen(question, survey_year, hits_arg, *, gateway):
-        del question, survey_year, hits_arg, gateway
+    async def fake_sql_gen(question, survey_year, hits_arg, *, gateway, feedback=None):
+        del question, survey_year, gateway, feedback
+        state["sql_gen_hits"] = [h.variable_name for h in hits_arg]
         order.append("sql_gen")
         return state["generated_sql"]
 
@@ -124,16 +137,22 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(generate, "compose", fake_compose)
     monkeypatch.setattr(sql_gen, "generate", fake_sql_gen)
 
-    return {"order": order, "state": state}
+    return {"order": order, "state": state, "db_ops": db_ops}
 
 
-async def run(pipeline, question: str = "How is food insecurity measured?") -> list[dict]:
+async def run(
+    pipeline,
+    question: str = "How is food insecurity measured?",
+    survey_year: int | None = 2023,
+) -> list[dict]:
     orchestrator = orch.Orchestrator(
         gateway=FakeLLMGateway(responses=["unused"]), embedder=FakeEmbedder()
     )
     return [
         event
-        async for event in orchestrator.handle_question(question, survey_year=2023)
+        async for event in orchestrator.handle_question(
+            question, survey_year=survey_year
+        )
     ]
 
 
@@ -288,7 +307,9 @@ async def test_data_intent_with_verified_sql_returns_a_result(pipeline):
     sql_event = next(e for e in events if e["type"] == "sql")
     assert sql_event["sql"]["verified"] is True
     result_event = next(e for e in events if e["type"] == "result")
-    assert result_event["result"]["columns"] == ["fdscat4_a", "wtfa_a"]
+    # Codes are labelled for the reader ("Yes (1)", not a bare 1).
+    assert result_event["result"]["columns"][0] == "FDSCAT4_A"
+    assert [row[0] for row in result_event["result"]["rows"]] == ["Yes (1)", "No (2)"]
     assert result_event["result"]["weight_variable"] == "WTFA_A"
     assert event_types.index("sql") < event_types.index("result")
     assert "sql_gen" in order and "execute" in order
@@ -352,3 +373,92 @@ async def test_gateway_failure_yields_error_and_logs_it(pipeline, monkeypatch):
     assert len(logged) == 1
     assert logged[0]["verdict"] is None
     assert "provider timeout" in logged[0]["error"]
+
+
+# ---------------------------------------------------------------------------
+# Conversation memory and year handling
+# ---------------------------------------------------------------------------
+async def test_history_is_read_before_the_question_is_saved(pipeline):
+    """A follow-up is rewritten from *earlier* turns, never from itself."""
+    await run(pipeline)
+    ops = pipeline["db_ops"]
+    assert ops.index("load_history") < ops.index("insert_user")
+
+
+async def test_year_named_in_the_question_beats_the_selector(pipeline):
+    pipeline["state"]["intent"] = "codebook"
+    await run(pipeline, "How is food insecurity measured in 2021?", survey_year=2023)
+    assert pipeline["state"]["searched_year"] == 2021
+
+
+async def test_statistics_question_without_a_year_uses_the_latest(pipeline):
+    pipeline["state"]["intent"] = "data"
+    await run(pipeline, "What is the average age of adults?", survey_year=None)
+    assert pipeline["state"]["searched_year"] == 2023
+
+
+async def test_codebook_question_without_a_year_stays_cross_year(pipeline):
+    pipeline["state"]["intent"] = "codebook"
+    await run(pipeline, "How is food insecurity measured?", survey_year=None)
+    assert pipeline["state"]["searched_year"] is None
+
+
+async def test_rejected_sql_gets_one_repair_attempt(pipeline):
+    """A first attempt that fails verification is retried once with feedback."""
+    state = pipeline["state"]
+    state["intent"] = "data"
+    state["survey_table_exists"] = True
+    # Always invalid (99 is not a code of the fixture variable), so both
+    # attempts are rejected: exactly two generations, never an execution.
+    state["generated_sql"] = (
+        "SELECT FDSCAT4_A, WTFA_A FROM survey_2023 WHERE FDSCAT4_A NOT IN (99)"
+    )
+    await run(pipeline, "What share are food insecure?")
+    order = pipeline["order"]
+    assert order.count("sql_gen") == 2
+    assert "execute" not in order
+
+
+async def test_empty_result_is_never_presented_as_a_number(pipeline):
+    state = pipeline["state"]
+    state["intent"] = "data"
+    state["survey_table_exists"] = True
+    state["generated_sql"] = (
+        "SELECT SUM(FDSCAT4_A * WTFA_A) / SUM(WTFA_A) AS weighted_mean "
+        "FROM survey_2023 WHERE FDSCAT4_A NOT IN (7)"
+    )
+    state["sql_result"] = readonly_store.SqlResult(
+        columns=["weighted_mean"], rows=[[None]]
+    )
+    events = await run(pipeline, "What is the average food security?")
+    assert "result" not in types_of(events)
+    assert "matched no respondents" in answer_of(events)
+
+
+async def test_bmi_statistics_question_pulls_in_height_and_weight(pipeline):
+    """BMI is computable only if both inputs are candidates, whatever retrieval ranked."""
+    state = pipeline["state"]
+    state["intent"] = "data"
+    state["survey_table_exists"] = True
+    state["fetchable"] = {
+        "HEIGHTTC_A": make_hit("HEIGHTTC_A", 1.0),
+        "WEIGHTLBTC_A": make_hit("WEIGHTLBTC_A", 1.0),
+    }
+    state["generated_sql"] = "SELECT 1"
+    await run(pipeline, "What is the average body mass index of adults?")
+    assert sorted(state["fetched"]) == ["HEIGHTTC_A", "WEIGHTLBTC_A"]
+    assert {"HEIGHTTC_A", "WEIGHTLBTC_A"} <= set(state["sql_gen_hits"] or [])
+
+
+async def test_derivation_inputs_are_not_fetched_when_already_retrieved(pipeline):
+    state = pipeline["state"]
+    state["intent"] = "data"
+    state["hits"] = [make_hit("HEIGHTTC_A", 0.4), make_hit("WEIGHTLBTC_A", 0.5)]
+    await run(pipeline, "What is the average BMI?")
+    assert state["fetched"] == []
+
+
+async def test_codebook_question_about_bmi_does_not_fetch_derivation_inputs(pipeline):
+    pipeline["state"]["intent"] = "codebook"
+    await run(pipeline, "How is BMI measured?")
+    assert pipeline["state"]["fetched"] == []

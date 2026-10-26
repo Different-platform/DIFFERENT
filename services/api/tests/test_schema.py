@@ -177,3 +177,19 @@ def test_retrieval_excludes_design_variables(db_conn):
     names = {h.variable_name for h in hits}
     leaked = names & set(vector_store.NON_SUBSTANTIVE_VARIABLES)
     assert leaked == set(), f"design variables leaked into retrieval: {leaked}"
+
+
+@pytest.mark.parametrize("year", [2019, 2020, 2021, 2022, 2023])
+def test_year_filtered_search_returns_the_requested_number_of_rows(db_conn, year):
+    """A year filter must not shrink the candidate list.
+
+    Without iterative scan, HNSW picks its nearest candidates across all years
+    and then filters, so a request for 10 variables returned 6-7 and dropped
+    relevant ones (for example the height variable needed to derive BMI).
+    """
+    from services.api.store import vector_store
+
+    probe = [1.0] + [0.0] * 767
+    hits = vector_store.search_variables(db_conn, probe, survey_year=year, limit=10)
+    assert len(hits) == 10
+    assert {h.survey_year for h in hits} == {year}

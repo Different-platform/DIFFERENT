@@ -160,3 +160,85 @@ def test_property_6_verifier_accepts_iff_all_codes_defined(codes):
     assert unknown == expected_unknown
     all_defined = all(Decimal(c) in CODEBOOK["hispallp_a"] for c in codes)
     assert (unknown == set()) is all_defined
+
+
+# ---------------------------------------------------------------------------
+# Missing-data exclusion (derived measures such as BMI depend on this)
+# ---------------------------------------------------------------------------
+SENTINELS = {
+    "heighttc_a": frozenset(Decimal(c) for c in (96, 97, 98, 99)),
+    "weightlbtc_a": frozenset(Decimal(c) for c in (996, 997, 998, 999)),
+    "bmicat_a": frozenset({Decimal(9)}),
+}
+FULL = {
+    **SENTINELS,
+    "bmicat_a": frozenset(Decimal(c) for c in (1, 2, 3, 4, 9)),
+}
+
+BMI_OK = (
+    "SELECT SUM(703.0 * WEIGHTLBTC_A / (HEIGHTTC_A * HEIGHTTC_A) * WTFA_A) "
+    "/ SUM(WTFA_A) AS weighted_mean_bmi FROM survey_2023 "
+    "WHERE HEIGHTTC_A NOT IN (96, 97, 98, 99) "
+    "AND WEIGHTLBTC_A NOT IN (996, 997, 998, 999)"
+)
+
+
+def test_derived_measure_excluding_all_missing_codes_passes():
+    assert check(BMI_OK, FULL, SENTINELS) == []
+
+
+def test_derived_measure_forgetting_a_column_is_rejected():
+    """The failure this guards: BMI averaged over raw weights including 999."""
+    sql = BMI_OK.replace(
+        " AND WEIGHTLBTC_A NOT IN (996, 997, 998, 999)", ""
+    )
+    problems = check(sql, FULL, SENTINELS)
+    assert [p.kind for p in problems] == ["sentinel_not_excluded"]
+    assert problems[0].column == "WEIGHTLBTC_A"
+
+
+def test_partial_exclusion_is_rejected():
+    sql = BMI_OK.replace("(996, 997, 998, 999)", "(999)")
+    problems = check(sql, FULL, SENTINELS)
+    assert {p.column for p in problems} == {"WEIGHTLBTC_A"}
+
+
+def test_not_equal_chain_counts_as_exclusion():
+    sql = (
+        "SELECT SUM(BMICAT_A * WTFA_A) / SUM(WTFA_A) FROM survey_2023 "
+        "WHERE BMICAT_A != 9"
+    )
+    assert check(sql, FULL, SENTINELS) == []
+
+
+def test_filtering_to_one_substantive_category_counts_as_exclusion():
+    sql = "SELECT SUM(WTFA_A) FROM survey_2023 WHERE BMICAT_A = 4"
+    assert check(sql, FULL, SENTINELS) == []
+
+
+def test_case_expression_alone_does_not_exclude_anything():
+    """CASE picks a numerator; it filters no rows, so the denominator is dirty."""
+    sql = (
+        "SELECT SUM(CASE WHEN BMICAT_A = 4 THEN WTFA_A ELSE 0 END) / SUM(WTFA_A) "
+        "AS proportion FROM survey_2023"
+    )
+    problems = check(sql, FULL, SENTINELS)
+    assert [p.kind for p in problems] == ["sentinel_not_excluded"]
+
+
+def test_share_in_category_with_clean_denominator_passes():
+    sql = (
+        "SELECT SUM(CASE WHEN BMICAT_A = 4 THEN WTFA_A ELSE 0 END) / SUM(WTFA_A) "
+        "AS proportion FROM survey_2023 WHERE BMICAT_A NOT IN (9)"
+    )
+    assert check(sql, FULL, SENTINELS) == []
+
+
+def test_column_not_used_needs_no_exclusion():
+    sql = "SELECT SUM(WTFA_A) FROM survey_2023 WHERE BMICAT_A NOT IN (9)"
+    assert check(sql, FULL, SENTINELS) == []
+
+
+def test_without_sentinels_argument_behaviour_is_unchanged():
+    sql = "SELECT SUM(WTFA_A) / COUNT(*) FROM survey_2023 WHERE BMICAT_A > 0"
+    assert "sentinel_not_excluded" not in {p.kind for p in check(sql, FULL)}

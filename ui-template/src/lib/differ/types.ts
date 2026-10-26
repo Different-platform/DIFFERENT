@@ -44,4 +44,7 @@ export interface Conversation {
   messages: Message[];
 }
 
-export const SURVEY_YEARS = [2017, 2018, 2019, 2020, 2021, 2022, 2023] as const;
+// Only years whose data is loaded in the backend. 2017-2018 are in the spec
+// but were never ingested (no value-label codebooks were available), so
+// offering them would only produce answers that say "nothing found".
+export const SURVEY_YEARS = [2019, 2020, 2021, 2022, 2023] as const;

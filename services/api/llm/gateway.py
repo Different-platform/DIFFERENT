@@ -79,7 +79,14 @@ class GroqGateway:
         # not need the SDK present at import time.
         from groq import AsyncGroq
 
-        self._client = AsyncGroq(api_key=api_key, timeout=timeout_seconds)
+        # The SDK retries rate-limit (429) and transient errors, waiting as
+        # long as the server's retry-after asks. Its default of 2 retries is
+        # too few for a free tier capped on tokens per minute: one question
+        # makes 3-4 calls, and a short burst is enough to hit the cap. Retrying
+        # is invisible to the researcher; failing the question is not.
+        self._client = AsyncGroq(
+            api_key=api_key, timeout=timeout_seconds, max_retries=6
+        )
         self.model = model
 
     def _payload(self, system: str, messages: list[Message]) -> list[dict[str, str]]:

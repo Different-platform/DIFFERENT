@@ -49,6 +49,41 @@
       "note": "Weighted proportion over a categorical measure."
     },
     {
+      "id": "d3",
+      "question": "What percent of adults are obese?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "note": "Share in ONE category of a categorical measure (CASE WHEN ... with missing data excluded from the denominator)."
+    },
+    {
+      "id": "b1",
+      "conversation": "bmi",
+      "question": "What is the weighted mean BMI for adults?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "note": "No single BMI variable exists in 2023; the mean must be DERIVED from height and weight, with missing codes excluded for both."
+    },
+    {
+      "id": "b2",
+      "conversation": "bmi",
+      "question": "Can you do it categorically?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "note": "Follow-up. Needs conversation memory: 'it' is the BMI mean; 'categorically' turns it into a distribution over BMI categories."
+    },
+    {
+      "id": "b3",
+      "conversation": "bmi",
+      "question": "What about 2021?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "note": "Follow-up that is meaningless without history; also checks a year in the question overrides the selector."
+    },
+    {
       "id": "a1",
       "question": "What percentage of adults own a firearm?",
       "expect_verdict": "ABSENT",

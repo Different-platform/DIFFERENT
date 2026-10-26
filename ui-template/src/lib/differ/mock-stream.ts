@@ -13,7 +13,10 @@ export type StreamEvent =
   | { type: "sql"; sql: SqlResult }
   | { type: "result"; result: NumericResult } // only when sql.verified
   | { type: "token"; text: string }
-  | { type: "done" };
+  // Emitted by the real API when the pipeline fails; the mock never sends it.
+  | { type: "error"; message: string }
+  // The API attaches the saved message id; the mock sends none.
+  | { type: "done"; message_id?: number | null };
 
 interface Scenario {
   route: RouteIntent;

@@ -18,8 +18,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
+import { ask, USE_MOCK } from "@/lib/differ/ask";
 import { MOCK_CONVERSATIONS } from "@/lib/differ/mock-data";
-import { mockAsk } from "@/lib/differ/mock-stream";
 import type { Conversation, Message } from "@/lib/differ/types";
 
 function newId(prefix: string) {
@@ -28,7 +28,10 @@ function newId(prefix: string) {
 
 function createBlankConversation(defaultYear: number | null): Conversation {
   return {
-    id: newId("conv"),
+    // The id doubles as the backend's conversation_id, which is how the
+    // server finds earlier turns to resolve follow-ups like "what about
+    // 2021?". It must be a real UUID and stay the same for the whole thread.
+    id: crypto.randomUUID(),
     title: "New conversation",
     default_year: defaultYear,
     created_at: new Date().toISOString(),
@@ -36,13 +39,19 @@ function createBlankConversation(defaultYear: number | null): Conversation {
   };
 }
 
+// Real mode starts with one empty conversation; the canned demo threads only
+// belong in offline mock mode (VITE_USE_MOCK=true).
+const INITIAL_CONVERSATIONS: Conversation[] = USE_MOCK
+  ? [...MOCK_CONVERSATIONS]
+  : [createBlankConversation(2023)];
+
 export function ConsolePage() {
-  const [conversations, setConversations] = useState<Conversation[]>(() => [
-    ...MOCK_CONVERSATIONS,
-  ]);
-  const [activeId, setActiveId] = useState<string>(MOCK_CONVERSATIONS[0].id);
+  const [conversations, setConversations] = useState<Conversation[]>(
+    INITIAL_CONVERSATIONS,
+  );
+  const [activeId, setActiveId] = useState<string>(INITIAL_CONVERSATIONS[0].id);
   const [selectedYear, setSelectedYear] = useState<number | null>(
-    MOCK_CONVERSATIONS[0].default_year,
+    INITIAL_CONVERSATIONS[0].default_year,
   );
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -120,36 +129,62 @@ export function ConsolePage() {
       );
     }
 
+    // Name a blank thread after its first question.
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.id === conversationId && c.title === "New conversation"
+          ? { ...c, title: question.slice(0, 60) }
+          : c,
+      ),
+    );
+
     let streamedContent = "";
 
-    for await (const event of mockAsk(question)) {
-      switch (event.type) {
-        case "route":
-          patchAssistant({ route: event.route, phase: "routing" });
-          break;
-        case "verdict":
-          patchAssistant({ verdict: event.verdict });
-          break;
-        case "citations":
-          patchAssistant({ citations: event.citations });
-          break;
-        case "sql":
-          patchAssistant({ sql: event.sql });
-          break;
-        case "result":
-          patchAssistant({ result: event.result });
-          break;
-        case "token":
-          streamedContent += event.text;
-          patchAssistant({ content: streamedContent, phase: "streaming" });
-          break;
-        case "done":
-          patchAssistant({ phase: "done" });
-          break;
+    try {
+      for await (const event of ask(question, {
+        conversationId,
+        year: selectedYear,
+      })) {
+        switch (event.type) {
+          case "route":
+            patchAssistant({ route: event.route, phase: "routing" });
+            break;
+          case "verdict":
+            patchAssistant({ verdict: event.verdict });
+            break;
+          case "citations":
+            patchAssistant({ citations: event.citations });
+            break;
+          case "sql":
+            patchAssistant({ sql: event.sql });
+            break;
+          case "result":
+            patchAssistant({ result: event.result });
+            break;
+          case "token":
+            streamedContent += event.text;
+            patchAssistant({ content: streamedContent, phase: "streaming" });
+            break;
+          case "error":
+            streamedContent = event.message;
+            patchAssistant({ content: event.message, phase: "done" });
+            break;
+          case "done":
+            patchAssistant({ phase: "done" });
+            break;
+        }
       }
+    } catch {
+      // Network failure or the API is down: say so instead of leaving the
+      // input locked on a reply that will never finish.
+      patchAssistant({
+        content:
+          "Couldn't reach the DIFFER API. Check that the backend is running and try again.",
+        phase: "done",
+      });
+    } finally {
+      setIsStreaming(false);
     }
-
-    setIsStreaming(false);
   }
 
   function handleSubmit() {
@@ -233,6 +268,7 @@ export function ConsolePage() {
           <div className="border-t border-border px-4 py-3">
             <div className="mx-auto flex max-w-3xl flex-col gap-2">
               <div className="flex items-center justify-between">
+                {USE_MOCK && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button variant="ghost" size="sm" className="text-muted-foreground">
@@ -259,7 +295,10 @@ export function ConsolePage() {
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
-                <RateLimitIndicator used={rateLimitUsed} />
+                )}
+                <div className="ml-auto">
+                  <RateLimitIndicator used={rateLimitUsed} />
+                </div>
               </div>
 
               {rateLimited ? (

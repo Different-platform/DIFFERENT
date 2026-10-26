@@ -17,6 +17,8 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from uuid import UUID
+
 from services.api.domain import SURVEY_YEARS_MAX, SURVEY_YEARS_MIN
 
 logger = logging.getLogger(__name__)
@@ -26,7 +28,10 @@ router = APIRouter(tags=["chat"])
 
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
-    conversation_id: str | None = None
+    # A real UUID or nothing. A malformed id is rejected with a 422 rather than
+    # quietly treated as a new conversation: silently dropping the id is how a
+    # client ends up with a chatbot that forgets every follow-up.
+    conversation_id: UUID | None = None
     year: int | None = Field(default=None, ge=SURVEY_YEARS_MIN, le=SURVEY_YEARS_MAX)
 
 

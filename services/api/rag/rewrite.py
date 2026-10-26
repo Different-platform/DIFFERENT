@@ -21,8 +21,26 @@ Rules:
 - Resolve pronouns and elliptical references using the history provided.
 - Preserve the researcher's terminology; do not substitute synonyms for \
 survey or clinical terms.
-- Do not answer the question, add detail, or infer intent beyond what was said.
+- Do not answer the question or add detail the researcher did not ask for.
+- A follow-up modifies the previous question. Keep every part the follow-up \
+does not change (the measure, the population, the year) and replace only the \
+part it does change. Asking for something "categorically" or "by category" \
+replaces a mean with a distribution across categories; naming a year or group \
+replaces the year or group.
 - If the question already stands alone, return it unchanged.
+
+Examples:
+History: Researcher: What is the weighted mean BMI for adults in 2023?
+Follow-up: Can you do it categorically?
+Standalone: What is the distribution of BMI categories among adults in 2023?
+
+History: Researcher: What percent of adults have diabetes in 2022?
+Follow-up: What about 2020?
+Standalone: What percent of adults have diabetes in 2020?
+
+History: Researcher: What percent of adults are obese in 2023?
+Follow-up: Break it down by sex.
+Standalone: What percent of adults are obese in 2023, broken down by sex?
 
 Return only the rewritten question, with no preamble or quotation marks.\
 """

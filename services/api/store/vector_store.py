@@ -7,6 +7,7 @@ the query is right here to read.
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 
 import psycopg
@@ -14,9 +15,36 @@ from psycopg.rows import dict_row
 
 from services.api.domain import Hit, SectionHit, ValueLabel
 
+logger = logging.getLogger(__name__)
+
 
 def _to_pgvector(vector: list[float]) -> str:
     return "[" + ",".join(repr(float(c)) for c in vector) + "]"
+
+
+def _enable_iterative_scan(conn: psycopg.Connection) -> None:
+    """Make a year-filtered vector search return as many rows as it was asked for.
+
+    An HNSW index collects its nearest candidates over *every* year and only
+    then applies `survey_year = X`. With five years in one table, most of the
+    candidates are discarded: asking for 10 variables for 2023 returned 6, and
+    asking about BMI for 2020 lost the height variable entirely, which turns
+    "BMI is computable" into "not measured". Iterative scan (pgvector 0.8+)
+    keeps walking the index until the filter is satisfied. `strict_order`
+    keeps results in exact distance order.
+
+    Best effort: on an older pgvector the setting does not exist, and the
+    failed statement aborts the open transaction, so roll back and carry on
+    with the old (lossy) behaviour rather than failing the question.
+    """
+    try:
+        conn.execute("SET hnsw.iterative_scan = 'strict_order'")
+    except psycopg.Error:
+        conn.rollback()
+        logger.warning(
+            "pgvector iterative scan unavailable; year-filtered search may "
+            "return fewer rows than requested"
+        )
 
 
 # Structural / design variables that are never a research concept: survey
@@ -109,6 +137,8 @@ def search_variables(
         "exclude": list(NON_SUBSTANTIVE_VARIABLES),
     }
 
+    _enable_iterative_scan(conn)
+
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(_SEARCH_VARIABLES, params)
         rows = cur.fetchall()
@@ -161,6 +191,8 @@ def search_sections(
 ) -> list[SectionHit]:
     vector = _to_pgvector(query_vector)
     params = {"query": vector, "survey_year": survey_year, "limit": limit}
+
+    _enable_iterative_scan(conn)
 
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(_SEARCH_SECTIONS, params)

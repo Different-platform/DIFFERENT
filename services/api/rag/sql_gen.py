@@ -35,20 +35,43 @@ Rules, all mandatory:
 semicolons beyond the single statement, no comments.
 - Query only the one table named in the context (survey_<year>).
 - Use ONLY the exact column names and numeric codes given in the context. Never \
-invent a code. The missing-data (sentinel) codes are listed explicitly — \
-exclude them with a NOT IN clause so the statistic is computed over real \
-answers only.
-- The estimate MUST be population-weighted by WTFA_A. Compute the statistic in \
-SQL; do not return raw per-respondent rows.
-  * Weighted mean of a continuous measure X: \
+invent a code.
+- Missing data: for EVERY column your query uses, add a predicate \
+`<column> NOT IN (<every missing-data code listed for that column>)` to the \
+WHERE clause, listing all of its codes. Use no other numeric filters (no <, >, \
+BETWEEN) unless the question asks about one specific category.
+- The estimate MUST be population-weighted by WTFA_A and computed in SQL. Never \
+return raw per-respondent rows.
+  * Weighted mean of a column X: \
     SELECT SUM(X * WTFA_A) / SUM(WTFA_A) AS weighted_mean FROM survey_<year> \
-    WHERE X NOT IN (<sentinels>).
-  * Weighted proportion / crosstab over a categorical column C: \
+    WHERE X NOT IN (<X codes>)
+  * Derived measure: when the question asks for a quantity no single column \
+holds but a standard formula defines it from columns in the context, compute \
+the formula inside the weighted mean. BMI from height in inches and weight in \
+pounds is 703 * weight / (height * height), so: \
+    SELECT SUM(703.0 * WEIGHT / (HEIGHT * HEIGHT) * WTFA_A) / SUM(WTFA_A) AS \
+    weighted_mean_bmi FROM survey_<year> WHERE HEIGHT NOT IN (<HEIGHT codes>) \
+    AND WEIGHT NOT IN (<WEIGHT codes>) \
+    Use a formula only when no column already holds the measure, and only a \
+standard one.
+  * Distribution of a categorical column C: \
     SELECT C, SUM(WTFA_A) / (SELECT SUM(WTFA_A) FROM survey_<year> WHERE C NOT \
-    IN (<sentinels>)) AS proportion FROM survey_<year> WHERE C NOT IN \
-    (<sentinels>) GROUP BY C ORDER BY C.
-- Give aggregate columns clear aliases (weighted_mean, proportion, \
-weighted_count). Do not round or format.
+    IN (<C codes>)) AS proportion FROM survey_<year> WHERE C NOT IN (<C codes>) \
+    GROUP BY C ORDER BY C
+  * Share in one category (for example "what percent are obese"): \
+    SELECT SUM(CASE WHEN C = <code> THEN WTFA_A ELSE 0 END) / SUM(WTFA_A) AS \
+    proportion FROM survey_<year> WHERE C NOT IN (<C codes>)
+  * Breakdown of C by a second categorical column D ("by sex", "for each \
+group"): report C's distribution WITHIN each D, so each D group sums to 100%: \
+    SELECT D, C, SUM(WTFA_A) / SUM(SUM(WTFA_A)) OVER (PARTITION BY D) AS \
+    proportion FROM survey_<year> WHERE C NOT IN (<C codes>) AND D NOT IN \
+    (<D codes>) GROUP BY D, C ORDER BY D, C
+  * Mean of a column X within each category of D: \
+    SELECT D, SUM(X * WTFA_A) / SUM(WTFA_A) AS weighted_mean FROM \
+    survey_<year> WHERE X NOT IN (<X codes>) AND D NOT IN (<D codes>) GROUP BY \
+    D ORDER BY D
+- Give aggregates clear aliases (weighted_mean, proportion, weighted_count). \
+Do not round or format.
 
 Respond with JSON only: {"sql": "<the SELECT statement>"}\
 """
@@ -102,12 +125,25 @@ def _code(value) -> str:
         return str(value)
 
 
-def build_prompt(question: str, hits: list[Hit], survey_year: int) -> str:
-    return (
+def build_prompt(
+    question: str,
+    hits: list[Hit],
+    survey_year: int,
+    feedback: list[str] | None = None,
+) -> str:
+    prompt = (
         f"Question: {question}\n\n"
         f"Available schema and codes:\n\n{format_schema(hits, survey_year)}\n\n"
         f"Write the SELECT that answers the question."
     )
+    if feedback:
+        problems = "\n".join(f"- {line}" for line in feedback)
+        prompt += (
+            "\n\nYour previous attempt was rejected by the verifier for these "
+            f"reasons:\n{problems}\nWrite a corrected SELECT that fixes every "
+            "one of them."
+        )
+    return prompt
 
 
 def _extract_sql(raw: str) -> str:
@@ -145,12 +181,21 @@ async def generate(
     hits: list[Hit],
     *,
     gateway: LLMGateway,
+    feedback: list[str] | None = None,
 ) -> str:
-    """Return a single SELECT string. It is NOT verified or executed here."""
+    """Return a single SELECT string. It is NOT verified or executed here.
+
+    `feedback` carries the verifier's reasons for rejecting a previous attempt,
+    so a repair attempt can fix them. The repaired SQL still has to pass the
+    verifier like any other; feedback makes a pass likelier, never unnecessary.
+    """
     response = await gateway.complete(
         system=SYSTEM_PROMPT,
         messages=[
-            Message(role="user", content=build_prompt(question, hits, survey_year))
+            Message(
+                role="user",
+                content=build_prompt(question, hits, survey_year, feedback),
+            )
         ],
         temperature=0.0,
         response_format="json",

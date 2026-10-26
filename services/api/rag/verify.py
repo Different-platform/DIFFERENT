@@ -162,7 +162,9 @@ def _split_statements(sql: str) -> list[str]:
     return [part.strip() for part in sql.split(";") if part.strip()]
 
 
-def check(sql: str, codebook: Codebook) -> list[Problem]:
+def check(
+    sql: str, codebook: Codebook, sentinels: Codebook | None = None
+) -> list[Problem]:
     """Return every reason `sql` must not run; empty means verified.
 
     `codebook` maps lower-cased survey column name -> the set of numeric codes
@@ -170,6 +172,13 @@ def check(sql: str, codebook: Codebook) -> list[Problem]:
     column absent from the mapping is not checked for codes (the generator may
     legitimately reference a continuous measure or a design variable), but the
     statement-shape guards still apply to the whole query.
+
+    `sentinels` maps the same column names to just their missing-data codes.
+    When given, every column the query uses must have those codes excluded.
+    Checking that codes *exist* is not enough: a mean of raw weights that still
+    contains 999 ("Don't know") passes the existence check and is silently
+    wrong. This matters most for derived measures such as BMI from height and
+    weight, where one unexcluded sentinel distorts the whole average.
     """
     problems: list[Problem] = []
     cleaned = _strip_sql(sql)
@@ -245,6 +254,89 @@ def check(sql: str, codebook: Codebook) -> list[Problem]:
         check_code(match.group("col"), match.group("lo"))
         check_code(match.group("col"), match.group("hi"))
 
+    if sentinels:
+        problems.extend(_sentinel_problems(cleaned, sentinels))
+
+    return problems
+
+
+# --- missing-data exclusion -------------------------------------------------
+
+_CASE_RE = re.compile(r"\bcase\b.*?\bend\b", re.IGNORECASE | re.DOTALL)
+
+
+def _decimals(text: str) -> set[Decimal]:
+    found: set[Decimal] = set()
+    for token in text.split(","):
+        token = token.strip()
+        if re.fullmatch(_NUM, token):
+            value = _to_decimal(token)
+            if value is not None:
+                found.add(value)
+    return found
+
+
+def _excludes_sentinels(text: str, column: str, codes: frozenset[Decimal]) -> bool:
+    """Whether `text` keeps every missing-data code of `column` out of the result.
+
+    Two ways to do it: list the codes in a NOT IN / != predicate, or admit only
+    substantive values with a positive predicate (`= 4`, `IN (1, 2)`, or a
+    BETWEEN range containing no missing-data code). `text` has CASE expressions
+    removed: `SUM(CASE WHEN c = 4 ...)` picks a numerator but filters no rows,
+    so it must not count as excluding anything.
+    """
+    col = re.escape(column)
+    flags = re.IGNORECASE
+
+    excluded: set[Decimal] = set()
+    for m in re.finditer(rf"\b{col}\s+not\s+in\s*\(([^)]*)\)", text, flags):
+        excluded |= _decimals(m.group(1))
+    for m in re.finditer(rf"\b{col}\s*(?:!=|<>)\s*({_NUM})", text, flags):
+        excluded |= _decimals(m.group(1))
+    for m in re.finditer(rf"({_NUM})\s*(?:!=|<>)\s*{col}\b", text, flags):
+        excluded |= _decimals(m.group(1))
+    if codes <= excluded:
+        return True
+
+    for m in re.finditer(rf"\b{col}\s+in\s*\(([^)]*)\)", text, flags):
+        admitted = _decimals(m.group(1))
+        if admitted and not (admitted & codes):
+            return True
+    for pattern in (rf"\b{col}\s*=\s*({_NUM})", rf"({_NUM})\s*=\s*{col}\b"):
+        for m in re.finditer(pattern, text, flags):
+            if _decimals(m.group(1)) - codes:
+                return True
+    for m in re.finditer(
+        rf"\b{col}\s+between\s+({_NUM})\s+and\s+({_NUM})", text, flags
+    ):
+        low, high = _to_decimal(m.group(1)), _to_decimal(m.group(2))
+        if low is not None and high is not None and not any(
+            low <= code <= high for code in codes
+        ):
+            return True
+    return False
+
+
+def _sentinel_problems(cleaned: str, sentinels: Codebook) -> list[Problem]:
+    without_case = _CASE_RE.sub(" ", cleaned)
+    problems: list[Problem] = []
+    for column, codes in sentinels.items():
+        if not codes or column.lower() in _UNCODED_COLUMNS:
+            continue
+        if not re.search(rf"\b{re.escape(column)}\b", cleaned, re.IGNORECASE):
+            continue
+        if _excludes_sentinels(without_case, column, frozenset(codes)):
+            continue
+        listed = ", ".join(str(_render(code)) for code in sorted(codes))
+        problems.append(
+            Problem(
+                "sentinel_not_excluded",
+                f"{column.upper()} has missing-data codes ({listed}) that this "
+                f"query does not exclude, so they would be counted as real "
+                f"answers. Add {column.upper()} NOT IN ({listed}).",
+                column=column.upper(),
+            )
+        )
     return problems
 
 
@@ -274,3 +366,22 @@ def codebook_from_hits(
         if codes:
             codebook[hit.variable_name.lower()] = codes
     return codebook
+
+
+def sentinels_from_hits(
+    hits, survey_year: int | None = None
+) -> dict[str, frozenset[Decimal]]:
+    """Each retrieved variable's missing-data codes, for `check(sentinels=...)`.
+
+    Variables with no sentinel codes are omitted: there is nothing to exclude.
+    Same year filter as `codebook_from_hits`, so a sentinel from another year's
+    edition of a variable cannot leak in.
+    """
+    found: dict[str, frozenset[Decimal]] = {}
+    for hit in hits:
+        if survey_year is not None and hit.survey_year != survey_year:
+            continue
+        codes = frozenset(vl.code for vl in hit.sentinel_labels)
+        if codes:
+            found[hit.variable_name.lower()] = codes
+    return found

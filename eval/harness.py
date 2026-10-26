@@ -35,6 +35,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from services.api.llm.gateway import build_gateway
 from services.api.orchestrator import Orchestrator
@@ -91,7 +92,10 @@ def load_questions() -> tuple[int, list[dict]]:
 
 
 async def _run_one(
-    orchestrator: Orchestrator, spec: dict, survey_year: int | None
+    orchestrator: Orchestrator,
+    spec: dict,
+    survey_year: int | None,
+    conversation_id: str | None = None,
 ) -> QuestionResult:
     """Drive the real pipeline for one question and collect its events."""
     verdict: str | None = None
@@ -101,7 +105,9 @@ async def _run_one(
     error: str | None = None
 
     async for event in orchestrator.handle_question(
-        spec["question"], survey_year=survey_year
+        spec["question"],
+        conversation_id=conversation_id,
+        survey_year=survey_year,
     ):
         kind = event.get("type")
         if kind == "verdict":
@@ -218,6 +224,7 @@ async def run_eval() -> list[QuestionResult]:
     orchestrator = Orchestrator(gateway=gateway, embedder=embedder)
 
     results: list[QuestionResult] = []
+    conversations: dict[str, str] = {}
     for index, spec in enumerate(questions):
         if index > 0:
             # Pace requests to stay under Groq's free-tier tokens-per-minute
@@ -226,7 +233,14 @@ async def run_eval() -> list[QuestionResult]:
             # reason that has nothing to do with pipeline quality. A retry on
             # 429 would be more elegant but belongs in the gateway, not here.
             await asyncio.sleep(EVAL_REQUEST_SPACING_SECONDS)
-        results.append(await _run_one(orchestrator, spec, survey_year))
+        # Questions sharing a "conversation" key are asked as one thread, so
+        # follow-ups are scored on whether the pipeline remembers the earlier
+        # turns. Standalone questions get no id and start fresh each time.
+        group = spec.get("conversation")
+        conversation_id = conversations.setdefault(group, str(uuid4())) if group else None
+        results.append(
+            await _run_one(orchestrator, spec, survey_year, conversation_id)
+        )
     return results
 
 

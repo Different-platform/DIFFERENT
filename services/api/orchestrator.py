@@ -29,12 +29,32 @@ from uuid import UUID
 from services.api import events
 from services.api.domain import Citation, Hit, RouteIntent, Verdict
 from services.api.llm.gateway import LLMGateway, LLMGatewayError
-from services.api.rag import generate, judge, retrieval, rewrite, router, sql_gen, verify
+from services.api.rag import (
+    derivations,
+    generate,
+    judge,
+    present,
+    retrieval,
+    rewrite,
+    router,
+    scope,
+    sql_gen,
+    verify,
+)
 from services.api.store import db, readonly_store, relational_store, vector_store
 
 logger = logging.getLogger(__name__)
 
 RETRIEVAL_LIMIT = 8
+
+#: Statistics questions retrieve a few more candidates. A derived measure such
+#: as BMI needs every input variable (height AND weight) to be retrieved, and a
+#: lower-ranked input silently turns "computable" into "not measured".
+RETRIEVAL_LIMIT_DATA = 10
+
+#: Extra attempts to repair SQL the verifier rejected. The repaired query must
+#: still pass the verifier; this only buys a second chance at a valid one.
+MAX_SQL_REPAIRS = 1
 
 
 class Orchestrator:
@@ -78,15 +98,17 @@ class Orchestrator:
                 default_year=survey_year,
                 title=question[:120],
             )
+            # Read history BEFORE saving this question, so the turn being asked
+            # can never appear in its own context. (The old approach saved
+            # first and then filtered by text, which also threw away any
+            # earlier turn that happened to repeat the same words.)
+            history = await db.run_db(relational_store.load_history, conversation_uuid)
             await db.run_db(
                 relational_store.insert_message,
                 conversation_uuid,
                 role="user",
                 content=question,
             )
-            history = await db.run_db(relational_store.load_history, conversation_uuid)
-            # Drop the turn just inserted; it is the question being asked.
-            history = [m for m in history if m.content != question] or []
 
             # --- stage 1: rewrite follow-ups into a standalone question ---
             standalone = await rewrite.to_standalone(
@@ -97,15 +119,30 @@ class Orchestrator:
             intent = await router.classify(standalone, gateway=self.gateway)
             yield events.route(intent)
 
+            # A year named in the question beats the selector; a statistics
+            # question with neither uses the latest year rather than mixing
+            # years (and says so in the answer).
+            survey_year, year_assumed = scope.resolve_year(
+                standalone, survey_year, intent
+            )
+
             # --- stage 3: retrieve ---
             vector = await retrieval.embed_question(standalone, self.embedder)
             hits = await db.run_db(
                 vector_store.search_variables,
                 vector,
                 survey_year=survey_year,
-                limit=RETRIEVAL_LIMIT,
+                limit=(
+                    RETRIEVAL_LIMIT_DATA
+                    if intent in ("data", "both")
+                    else RETRIEVAL_LIMIT
+                ),
             )
             hits = retrieval.dedupe_by_variable(hits)
+            if intent in ("data", "both") and survey_year is not None:
+                hits = await self._with_derivation_inputs(
+                    standalone, hits, survey_year
+                )
 
             # --- stage 4: presence judge ---
             verdict, closest, why = await judge.classify_presence(
@@ -140,11 +177,14 @@ class Orchestrator:
 
                 if intent in ("data", "both"):
                     async for event, chunk in self._verified_statistics(
-                        standalone, hits, survey_year, sql_state
+                        standalone, hits, survey_year, sql_state, year_assumed
                     ):
                         if chunk is not None:
                             answer_parts.append(chunk)
                         yield event
+                    # Persist the variables the query actually used, not just
+                    # the top retrieval hits.
+                    citations = sql_state.get("citations") or citations
                 else:
                     async for chunk in generate.compose(
                         standalone, hits, verdict, gateway=self.gateway
@@ -196,12 +236,35 @@ class Orchestrator:
             yield events.error(f"This question could not be processed: {exc}")
             yield events.done(None)
 
+    async def _with_derivation_inputs(
+        self, question: str, hits: list[Hit], survey_year: int
+    ) -> list[Hit]:
+        """Add the inputs of a known derived measure (BMI -> height, weight).
+
+        Appended at the end with the lowest score already present, so they are
+        visible to the judge and the SQL generator without outranking what
+        retrieval actually found (a fetched variable would otherwise carry a
+        meaningless similarity of 1.0).
+        """
+        present_names = {hit.variable_name for hit in hits}
+        floor = min((hit.similarity for hit in hits), default=0.0)
+        extra: list[Hit] = []
+        for name in derivations.required_inputs(question):
+            if name in present_names:
+                continue
+            found = await db.run_db(vector_store.get_variable, survey_year, name)
+            if found is not None:
+                found.similarity = floor
+                extra.append(found)
+        return hits + extra
+
     async def _verified_statistics(
         self,
         question: str,
         hits: list[Hit],
         survey_year: int | None,
         sql_state: dict,
+        year_assumed: bool = False,
     ) -> AsyncIterator[tuple[dict, str | None]]:
         """The verified-statistics path: generate -> verify -> execute -> compute.
 
@@ -225,16 +288,40 @@ class Orchestrator:
                 yield events.token(chunk), chunk
             return
 
-        # --- generate (codes injected, not recalled) ---
-        sql = await sql_gen.generate(question, survey_year, hits, gateway=self.gateway)
-        sql_state["sql"] = sql
-
-        # --- verify (pure, safety-critical gate) ---
+        # --- generate (codes injected, not recalled) and verify ---
+        # The verifier is the gate. If it rejects the first attempt, the
+        # model gets the reasons once and tries again; whatever is finally
+        # shown and run is whichever SQL the verifier last judged.
         codebook = verify.codebook_from_hits(hits, survey_year)
-        problems = verify.check(sql, codebook)
+        sentinels = verify.sentinels_from_hits(hits, survey_year)
+
+        sql = ""
+        problems: list[verify.Problem] = []
+        feedback: list[str] | None = None
+        for attempt in range(1 + MAX_SQL_REPAIRS):
+            sql = await sql_gen.generate(
+                question, survey_year, hits, gateway=self.gateway, feedback=feedback
+            )
+            problems = verify.check(sql, codebook, sentinels)
+            if not problems:
+                break
+            feedback = [p.message for p in problems]
+            logger.info(
+                "SQL attempt %d rejected by the verifier: %s", attempt + 1, feedback
+            )
+
         verified = not problems
+        sql_state["sql"] = sql
         sql_state["verified"] = verified
         sql_state["notes"] = [p.to_dict() for p in problems]
+
+        # Cite the variables the query actually used. Retrieval ranking is a
+        # guess about relevance; the SQL is what produced the number.
+        used = present.variables_in(sql, hits)
+        if used:
+            cited = [hit.to_citation() for hit in used]
+            sql_state["citations"] = cited
+            yield events.citations(cited), None
 
         yield (
             events.sql(sql, verified=verified, problems=[p.message for p in problems]),
@@ -260,14 +347,29 @@ class Orchestrator:
                 yield events.token(chunk), chunk
             return
 
-        # --- result event, then grounded prose ---
+        # An average over nobody is NULL. Never present that as a figure.
+        if present.is_empty(result.rows):
+            text = generate.empty_result_message(survey_year)
+            for chunk in _chunk(text):
+                yield events.token(chunk), chunk
+            return
+
+        # --- label the codes, format the numbers, describe what was computed ---
+        presented = present.present_result(
+            result.columns,
+            result.rows,
+            sql=sql,
+            hits=hits,
+            year=survey_year,
+            year_assumed=year_assumed,
+        )
         yield (
-            events.result(result.columns, result.rows, sql_gen.WEIGHT_COLUMN),
+            events.result(presented.columns, presented.rows, sql_gen.WEIGHT_COLUMN),
             None,
         )
-        text = generate.statistics_answer_message(
-            hits, result.columns, result.rows, sql_gen.WEIGHT_COLUMN
-        )
+        text = presented.summary
+        if result.truncated:
+            text += f" Only the first {readonly_store.MAX_ROWS} rows are shown."
         for chunk in _chunk(text):
             yield events.token(chunk), chunk
 

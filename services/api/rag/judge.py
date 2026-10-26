@@ -48,6 +48,14 @@ ABSENT - NHIS does not measure this concept at all. The retrieved variables \
 are topically unrelated to the question; they surfaced only because vector \
 search always returns its nearest neighbours.
 
+A concept also counts as MEASURED when it can be computed from the retrieved \
+variables by a standard, unambiguous formula, even if no single variable holds \
+it. Example: body mass index is defined as weight and height combined, which \
+is exactly how NHIS builds its own BMI categories, so height plus weight \
+variables measure BMI. Name the variables it is derived from in "why". Do not \
+stretch this to loose associations: the formula must define the concept \
+itself, and every input it needs must be among the retrieved variables.
+
 Judge construct equivalence, not topical similarity. Retrieval scores are \
 provided for context only; a high score does not make a variable the right \
 answer, and a low score does not make it wrong. Being candid that NHIS lacks \

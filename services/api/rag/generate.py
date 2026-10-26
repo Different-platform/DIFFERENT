@@ -228,31 +228,16 @@ def execution_failed_message() -> str:
     )
 
 
-def statistics_answer_message(
-    hits: list[Hit], columns: list[str], rows: list, weight_variable: str
-) -> str:
-    """Short prose accompanying a successfully computed, verified result.
+def empty_result_message(survey_year: int) -> str:
+    """Answer when a verified query ran but matched nobody.
 
-    Deliberately factual and brief — the table and the SQL carry the detail.
-    The one thing worth stating in words is that the figure is population-
-    weighted, since an unweighted NHIS number is a common and invisible error.
+    An average over zero people is NULL, not zero. Presenting that as a figure
+    would be a fabricated number, so say plainly that nothing matched.
     """
-    # The headline variable is the measure, not the weight or a design column
-    # that happened to rank highly in retrieval.
-    skip = {weight_variable.upper(), "WTFA_A", "WTFA_SA", "PSTRAT", "PPSU"}
-    measure = next(
-        (h.variable_name for h in hits if h.variable_name.upper() not in skip),
-        hits[0].variable_name if hits else "the measure",
-    )
-    value_hint = ""
-    if columns and rows and len(rows) == 1 and len(rows[0]) == 1:
-        value_hint = f" The computed value is {rows[0][0]}."
     return (
-        f"The result below is computed from the NHIS survey microdata, weighted "
-        f"by {weight_variable} so it estimates the US population rather than the "
-        f"sample.{value_hint} It passed verification against the codebook before "
-        f"running, and the exact query is shown above. The primary variable is "
-        f"{measure}."
+        f"The query ran against the {survey_year} data but matched no "
+        f"respondents, so there is no figure to report. This usually means the "
+        f"category or group asked about does not appear in that year's file."
     )
 
 
