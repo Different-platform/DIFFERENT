@@ -70,6 +70,10 @@ group"): report C's distribution WITHIN each D, so each D group sums to 100%: \
     SELECT D, SUM(X * WTFA_A) / SUM(WTFA_A) AS weighted_mean FROM \
     survey_<year> WHERE X NOT IN (<X codes>) AND D NOT IN (<D codes>) GROUP BY \
     D ORDER BY D
+- Do not add any filter the question did not ask for. The only conditions \
+allowed are the missing-data exclusions and the ones the question itself \
+states (a group, a category, an age range). Never filter on a household or \
+status variable just because it appears in the context.
 - Give aggregates clear aliases (weighted_mean, proportion, weighted_count). \
 Do not round or format.
 

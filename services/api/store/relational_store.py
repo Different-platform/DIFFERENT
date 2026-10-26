@@ -84,13 +84,18 @@ def insert_message(
     content: str,
     citations: list[Citation] | None = None,
     verdict: str | None = None,
+    generated_sql: str | None = None,
+    sql_verified: bool | None = None,
 ) -> int:
+    """Save one turn. `generated_sql` is kept so a later "explain that" can
+    answer from the computation that actually ran, not from a fresh guess."""
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO messages
-                (conversation_id, role, content, citations, verdict)
-            VALUES (%s, %s, %s, %s::jsonb, %s)
+                (conversation_id, role, content, citations, verdict,
+                 generated_sql, sql_verified)
+            VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -99,9 +104,30 @@ def insert_message(
                 content,
                 json.dumps([c.to_dict() for c in citations]) if citations else None,
                 verdict,
+                generated_sql,
+                sql_verified,
             ),
         )
         return cur.fetchone()[0]
+
+
+def load_last_assistant(
+    conn: psycopg.Connection, conversation_id: UUID | str
+) -> dict | None:
+    """The most recent assistant turn, with the SQL it ran (if any)."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT id, content, citations, verdict, generated_sql, sql_verified
+            FROM messages
+            WHERE conversation_id = %s AND role = 'assistant'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (str(conversation_id),),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
 
 
 def update_message(

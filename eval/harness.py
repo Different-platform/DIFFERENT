@@ -103,6 +103,7 @@ async def _run_one(
     verified: bool | None = None
     had_result = False
     error: str | None = None
+    answer_parts: list[str] = []
 
     async for event in orchestrator.handle_question(
         spec["question"],
@@ -118,10 +119,14 @@ async def _run_one(
             verified = event["sql"]["verified"]
         elif kind == "result":
             had_result = True
+        elif kind == "token":
+            answer_parts.append(event["text"])
         elif kind == "error":
             error = event["message"]
 
-    return _score(spec, verdict, citations, verified, had_result, error)
+    return _score(
+        spec, verdict, citations, verified, had_result, error, "".join(answer_parts)
+    )
 
 
 def _score(
@@ -131,6 +136,7 @@ def _score(
     verified: bool | None,
     had_result: bool,
     error: str | None,
+    answer: str = "",
 ) -> QuestionResult:
     """Decide pass/fail for one question and record why.
 
@@ -190,8 +196,20 @@ def _score(
             reasons.append(
                 f"sql_verified {verified!r} != expected {expect_verified!r}"
             )
-        if expect_verified and not had_result:
+        # An "explain that" turn re-shows the verified SQL but produces no new
+        # figure, so a spec can set expect_result=false.
+        if expect_verified and spec.get("expect_result", True) and not had_result:
             reasons.append("expected a verified result but no number was produced")
+
+    # Wording checks, for behaviour a verdict cannot show: an explanation must
+    # describe the calculation, and must not contradict the answer it explains.
+    lowered = answer.lower()
+    for needle in spec.get("expect_text", []):
+        if needle.lower() not in lowered:
+            reasons.append(f"answer does not mention {needle!r}")
+    for needle in spec.get("reject_text", []):
+        if needle.lower() in lowered:
+            reasons.append(f"answer contains {needle!r}")
 
     return QuestionResult(
         id=spec["id"], question=spec["question"], expect_verdict=expect_verdict,

@@ -242,6 +242,16 @@ export function ConsolePage() {
         </Button>
       </header>
 
+      {USE_MOCK && (
+        <div
+          role="status"
+          className="border-b border-warning/40 bg-warning/10 px-4 py-1.5 text-center text-xs text-foreground"
+        >
+          Demo mode: these are canned example answers with made-up numbers, not
+          real NHIS results.
+        </div>
+      )}
+
       <div className="flex flex-1 overflow-hidden">
         <aside className="hidden w-[280px] shrink-0 border-r border-sidebar-border lg:block">
           {sidebarPanel}

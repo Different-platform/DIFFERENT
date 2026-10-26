@@ -31,6 +31,8 @@ from services.api.domain import Citation, Hit, RouteIntent, Verdict
 from services.api.llm.gateway import LLMGateway, LLMGatewayError
 from services.api.rag import (
     derivations,
+    explain,
+    followup,
     generate,
     judge,
     present,
@@ -110,6 +112,34 @@ class Orchestrator:
                 content=question,
             )
 
+            # --- "explain that": answer from the computation that ran ---
+            # A request about the previous answer must not go back through
+            # retrieval and the judge, which never saw that computation and
+            # can contradict it. Only considered when the last turn was a
+            # computed, verified statistic.
+            prior = (
+                await db.run_db(relational_store.load_last_assistant, conversation_uuid)
+                if history
+                else None
+            )
+            if prior and prior.get("generated_sql") and prior.get("sql_verified"):
+                prior_question = next(
+                    (m.content for m in reversed(history) if m.role == "user"), ""
+                )
+                if await followup.asks_for_explanation(
+                    question, prior_question, prior["content"], gateway=self.gateway
+                ):
+                    async for event in self._explain_previous(
+                        question,
+                        prior,
+                        prior_question,
+                        conversation_uuid,
+                        started,
+                        sql_state,
+                    ):
+                        yield event
+                    return
+
             # --- stage 1: rewrite follow-ups into a standalone question ---
             standalone = await rewrite.to_standalone(
                 question, history, gateway=self.gateway
@@ -145,9 +175,26 @@ class Orchestrator:
                 )
 
             # --- stage 4: presence judge ---
-            verdict, closest, why = await judge.classify_presence(
-                standalone, hits, gateway=self.gateway
+            # A known derivation (BMI = height + weight) is decided by the
+            # table, not the model. The same question used to come back
+            # MEASURED one minute and "no BMI variable exists" the next,
+            # because the judge is a language model and flips on borderline
+            # wording. When every input of the derivation is present for the
+            # chosen year the concept is measured by definition.
+            inputs = (
+                derivations.required_inputs(standalone)
+                if intent in ("data", "both")
+                else []
             )
+            by_name = {hit.variable_name: hit for hit in hits}
+            if inputs and all(name in by_name for name in inputs):
+                verdict = "MEASURED"
+                closest = by_name[inputs[0]]
+                why = "Derived from " + " and ".join(inputs) + "."
+            else:
+                verdict, closest, why = await judge.classify_presence(
+                    standalone, hits, gateway=self.gateway
+                )
             yield events.verdict(verdict)
 
             # --- stage 5: answer, branching on verdict then intent ---
@@ -201,6 +248,14 @@ class Orchestrator:
                 content=answer,
                 citations=citations or None,
                 verdict=verdict,
+                # Kept so "explain that" can answer from what actually ran.
+                # Only a query that produced a figure counts as explainable.
+                generated_sql=(
+                    sql_state["sql"]
+                    if sql_state.get("answered") or sql_state.get("sql") is None
+                    else None
+                ),
+                sql_verified=True if sql_state.get("answered") else sql_state["verified"],
             )
 
             await self._log(
@@ -235,6 +290,79 @@ class Orchestrator:
             )
             yield events.error(f"This question could not be processed: {exc}")
             yield events.done(None)
+
+    async def _explain_previous(
+        self,
+        question: str,
+        prior: dict,
+        prior_question: str,
+        conversation_uuid,
+        started: float,
+        sql_state: dict,
+    ) -> AsyncIterator[dict]:
+        """Explain the last computed statistic from its saved SQL and summary.
+
+        No retrieval, no judge, no new SQL, no new figure: the SQL panel is
+        shown again so the explanation sits next to the query it describes,
+        and the explanation is checked for numbers that were not in the
+        material it was given (see rag/explain.py).
+        """
+        sql = prior["generated_sql"]
+        verdict = prior.get("verdict") or "MEASURED"
+        fields = Citation.__dataclass_fields__
+        citations = [
+            Citation(**{k: v for k, v in c.items() if k in fields})
+            for c in (prior.get("citations") or [])
+        ]
+
+        yield events.route("data")
+        yield events.verdict(verdict)
+        if citations:
+            yield events.citations(citations)
+        yield events.sql(sql, verified=True, problems=[])
+
+        year = explain.year_of(sql)
+        variables: list[Hit] = []
+        if year is not None:
+            for name in explain.variable_names(sql):
+                found = await db.run_db(vector_store.get_variable, year, name)
+                if found is not None:
+                    variables.append(found)
+
+        text = await explain.compose(
+            question=prior_question,
+            summary=prior["content"],
+            sql=sql,
+            variables=variables,
+            gateway=self.gateway,
+        )
+        for chunk in _chunk(text):
+            yield events.token(chunk)
+
+        # The SQL is carried forward so a second "explain more" still works.
+        message_id = await db.run_db(
+            relational_store.insert_message,
+            conversation_uuid,
+            role="assistant",
+            content=text,
+            citations=citations or None,
+            verdict=verdict,
+            generated_sql=sql,
+            sql_verified=True,
+        )
+        sql_state.update(sql=sql, verified=True, notes=None)
+        await self._log(
+            question=question,
+            standalone=question,
+            conversation_uuid=conversation_uuid,
+            message_id=message_id,
+            intent="explain",
+            verdict=verdict,
+            hits=[],
+            started=started,
+            sql_state=sql_state,
+        )
+        yield events.done(message_id)
 
     async def _with_derivation_inputs(
         self, question: str, hits: list[Hit], survey_year: int
@@ -367,6 +495,7 @@ class Orchestrator:
             events.result(presented.columns, presented.rows, sql_gen.WEIGHT_COLUMN),
             None,
         )
+        sql_state["answered"] = True
         text = presented.summary
         if result.truncated:
             text += f" Only the first {readonly_store.MAX_ROWS} rows are shown."

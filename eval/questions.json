@@ -84,6 +84,27 @@
       "note": "Follow-up that is meaningless without history; also checks a year in the question overrides the selector."
     },
     {
+      "id": "e1",
+      "conversation": "explain",
+      "question": "What's the weighted mean BMI for adults in 2023?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "note": "Sets up the explain turn below."
+    },
+    {
+      "id": "e2",
+      "conversation": "explain",
+      "question": "Explain me in detail",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "expect_result": false,
+      "expect_text": ["height", "weight"],
+      "reject_text": ["cannot be computed", "does not include a continuous", "no continuous"],
+      "note": "Regression: this used to go back through retrieval and the judge, which answered that BMI could not be computed, contradicting the answer it was asked to explain. It must explain the saved calculation and produce no new number."
+    },
+    {
       "id": "a1",
       "question": "What percentage of adults own a firearm?",
       "expect_verdict": "ABSENT",
