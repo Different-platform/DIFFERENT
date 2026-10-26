@@ -1,0 +1,15 @@
+{
+  "pass_rate": 1.0,
+  "strategy": "eval-v1",
+  "per_question": {
+    "m1": true,
+    "m2": true,
+    "m3": true,
+    "m4": true,
+    "d1": true,
+    "d2": true,
+    "a1": true,
+    "a2": true,
+    "r1": true
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "_comment": "Fixed eval question set (design.md — Eval harness). Expected verdicts are grounded in the real 2019-2023 NHIS Sample Adult data loaded in Supabase. 'expect_variable' is a variable that SHOULD appear among the retrieved candidates / citations for a MEASURED or RELATED question; it is checked as membership, not as the sole answer. 'expect_verified' applies only to data-intent questions and asserts whether the generated SQL should pass verification. Keep this set small, stable, and documented — the whole point is a comparable baseline.",
+  "survey_year": 2023,
+  "questions": [
+    {
+      "id": "m1",
+      "question": "How is food insecurity measured?",
+      "expect_verdict": "MEASURED",
+      "expect_variable": "FDSCAT4_A",
+      "note": "Core food-security recode; a canonical MEASURED/codebook case."
+    },
+    {
+      "id": "m2",
+      "question": "Does NHIS measure whether an adult has ever been told they have diabetes?",
+      "expect_verdict": "MEASURED",
+      "expect_variable": "DIBEV_A",
+      "note": "Ever-told-diabetes; clearly measured."
+    },
+    {
+      "id": "m3",
+      "question": "Does the survey record a respondent's age?",
+      "expect_verdict": "MEASURED",
+      "expect_variable_any": ["AGEP_A", "AGE65"],
+      "note": "Age is measured; several age variables exist (AGEP_A continuous, AGE65 flag). Accept any of them among citations."
+    },
+    {
+      "id": "m4",
+      "question": "Is hypertension (high blood pressure) measured in NHIS?",
+      "expect_verdict": "MEASURED",
+      "expect_variable": "HYPEV_A",
+      "note": "Ever-told-hypertension."
+    },
+    {
+      "id": "d1",
+      "question": "What is the average age of adults?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_variable": "AGEP_A",
+      "expect_verified": true,
+      "note": "Weighted mean over a continuous measure; SQL must verify and execute."
+    },
+    {
+      "id": "d2",
+      "question": "What percentage of adults have ever been told they have diabetes?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_variable": "DIBEV_A",
+      "expect_verified": true,
+      "note": "Weighted proportion over a categorical measure."
+    },
+    {
+      "id": "a1",
+      "question": "What percentage of adults own a firearm?",
+      "expect_verdict": "ABSENT",
+      "note": "NHIS does not ask about firearm ownership; must refuse to cite or compute."
+    },
+    {
+      "id": "a2",
+      "question": "How many hours per week do adults spend playing video games?",
+      "expect_verdict": "ABSENT",
+      "note": "Not a concept NHIS measures."
+    },
+    {
+      "id": "r1",
+      "question": "Does NHIS measure loneliness?",
+      "expect_verdict": "RELATED",
+      "note": "No direct loneliness measure; closest is a social-support proxy. RELATED or ABSENT both acceptable interpretations — scored loosely (see runner)."
+    }
+  ]
+}
