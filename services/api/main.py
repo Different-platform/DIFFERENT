@@ -1,7 +1,11 @@
 """FastAPI application (Requirements 13.1, 13.2, 16.3).
 
 Run from the repo root:
-    .venv/bin/uvicorn services.api.main:app --reload --port 8000
+    .venv/bin/uvicorn services.api.main:app --reload --port 8100
+
+Port 8100, not 8000: 8000 is commonly taken by other local tools (a Chroma
+container was answering there), and a browser resolving "localhost" reaches
+the IPv6 listener first.
 
 The embedding model is loaded once at startup and held for the process
 lifetime. That is the constraint that rules out serverless hosting: ~420 MB of
@@ -99,9 +103,23 @@ app.add_middleware(
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(TimingMiddleware)
+def allowed_origins(origin: str) -> list[str]:
+    """The configured UI origin, plus its loopback twin.
+
+    http://localhost:5173 and http://127.0.0.1:5173 are different origins to a
+    browser. Opening the UI by either address is normal, and the wrong one
+    fails with a bare "failed to fetch" and no hint why.
+    """
+    origins = [origin]
+    for here, there in (("//localhost", "//127.0.0.1"), ("//127.0.0.1", "//localhost")):
+        if here in origin:
+            origins.append(origin.replace(here, there))
+    return origins
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_origin],
+    allow_origins=allowed_origins(settings.frontend_origin),
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],

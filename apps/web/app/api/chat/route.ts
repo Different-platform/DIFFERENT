@@ -20,7 +20,7 @@ export const runtime = "nodejs";
 // Server-only configuration. Note: NOT prefixed NEXT_PUBLIC_, so Next.js will
 // refuse to inline these into client code — a build-time guarantee the secret
 // cannot leak to the browser.
-const API_BASE_URL = process.env.API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE_URL = process.env.API_BASE_URL ?? "http://127.0.0.1:8100";
 const API_SHARED_SECRET = process.env.API_SHARED_SECRET ?? "";
 
 export async function POST(request: NextRequest) {

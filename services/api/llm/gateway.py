@@ -45,6 +45,51 @@ class LLMGatewayError(RuntimeError):
     """
 
 
+class LLMRateLimitError(LLMGatewayError):
+    """The provider refused the call because a usage limit was reached.
+
+    Kept distinct because it is the one failure the user can act on, and
+    "the language model did not respond" hides it: nothing is broken, the
+    quota is spent and will free up. `retry_after_seconds` is the provider's
+    own estimate; `daily` is True for a per-day token cap, where retrying in
+    a few seconds cannot help.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+        daily: bool = False,
+    ):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        self.daily = daily
+
+
+def _translate_provider_error(exc: Exception, what: str) -> LLMGatewayError:
+    """Turn a Groq SDK exception into this module's error types."""
+    try:
+        from groq import RateLimitError
+    except ImportError:  # pragma: no cover - only without the SDK installed
+        RateLimitError = ()  # type: ignore[assignment]
+
+    if RateLimitError and isinstance(exc, RateLimitError):
+        retry_after: float | None = None
+        response = getattr(exc, "response", None)
+        raw = response.headers.get("retry-after") if response is not None else None
+        try:
+            retry_after = float(raw) if raw is not None else None
+        except ValueError:
+            retry_after = None
+        return LLMRateLimitError(
+            f"Groq rate limit reached: {exc}",
+            retry_after_seconds=retry_after,
+            daily="per day" in str(exc),
+        )
+    return LLMGatewayError(f"Groq {what} failed: {exc}")
+
+
 @runtime_checkable
 class LLMGateway(Protocol):
     """The contract every pipeline stage depends on."""
@@ -114,8 +159,8 @@ class GroqGateway:
 
         try:
             completion = await self._client.chat.completions.create(**kwargs)
-        except Exception as exc:  # provider errors are not ours to classify
-            raise LLMGatewayError(f"Groq completion failed: {exc}") from exc
+        except Exception as exc:
+            raise _translate_provider_error(exc, "completion") from exc
 
         choice = completion.choices[0].message.content or ""
         return LLMResponse(text=choice, model=self.model)
@@ -141,7 +186,7 @@ class GroqGateway:
                 if delta:
                     yield delta
         except Exception as exc:
-            raise LLMGatewayError(f"Groq stream failed: {exc}") from exc
+            raise _translate_provider_error(exc, "stream") from exc
 
 
 #: Signature of a fake gateway's response policy.

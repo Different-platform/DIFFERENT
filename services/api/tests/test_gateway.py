@@ -127,3 +127,47 @@ async def test_property_11_streaming_shape_is_implementation_independent():
 
     assert await consume(CharGateway()) == "hello"
     assert await consume(FakeLLMGateway(responses=["hello"])) == "hello"
+
+
+# ---------------------------------------------------------------------------
+# Provider rate limits are reported as what they are
+# ---------------------------------------------------------------------------
+def _groq_rate_limit(message: str, retry_after: str | None):
+    import httpx
+    from groq import RateLimitError
+
+    headers = {"retry-after": retry_after} if retry_after else {}
+    response = httpx.Response(
+        429, headers=headers, request=httpx.Request("POST", "https://example.test")
+    )
+    return RateLimitError(message, response=response, body=None)
+
+
+def test_daily_token_cap_becomes_a_rate_limit_error_with_the_wait():
+    from services.api.llm.gateway import LLMRateLimitError, _translate_provider_error
+
+    exc = _groq_rate_limit(
+        "Rate limit reached on tokens per day (TPD): Limit 200000", "582"
+    )
+    translated = _translate_provider_error(exc, "completion")
+    assert isinstance(translated, LLMRateLimitError)
+    assert translated.daily is True
+    assert translated.retry_after_seconds == 582.0
+
+
+def test_per_minute_cap_is_not_flagged_as_daily():
+    from services.api.llm.gateway import LLMRateLimitError, _translate_provider_error
+
+    exc = _groq_rate_limit("Rate limit reached on tokens per minute (TPM)", None)
+    translated = _translate_provider_error(exc, "completion")
+    assert isinstance(translated, LLMRateLimitError)
+    assert translated.daily is False and translated.retry_after_seconds is None
+
+
+def test_other_provider_failures_stay_generic_gateway_errors():
+    from services.api.llm.gateway import LLMGatewayError, LLMRateLimitError
+    from services.api.llm.gateway import _translate_provider_error
+
+    translated = _translate_provider_error(RuntimeError("boom"), "completion")
+    assert isinstance(translated, LLMGatewayError)
+    assert not isinstance(translated, LLMRateLimitError)

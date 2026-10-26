@@ -28,7 +28,7 @@ from uuid import UUID
 
 from services.api import events
 from services.api.domain import Citation, Hit, RouteIntent, Verdict
-from services.api.llm.gateway import LLMGateway, LLMGatewayError
+from services.api.llm.gateway import LLMGateway, LLMGatewayError, LLMRateLimitError
 from services.api.rag import (
     derivations,
     explain,
@@ -271,6 +271,16 @@ class Orchestrator:
             )
 
             yield events.done(assistant_message_id)
+
+        except LLMRateLimitError as exc:
+            # Not an outage: the provider's usage cap is spent. Say so, with
+            # the provider's own estimate of when it frees up.
+            logger.warning("LLM usage limit reached: %s", exc)
+            await self._log_error(
+                question, standalone, conversation_uuid, intent, hits, started, str(exc)
+            )
+            yield events.error(_rate_limit_message(exc))
+            yield events.done(None)
 
         except LLMGatewayError as exc:
             logger.exception("LLM gateway failed")
@@ -561,6 +571,18 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             # Telemetry must never mask the original failure.
             logger.exception("failed to write the error row to query_log")
+
+
+def _rate_limit_message(exc: LLMRateLimitError) -> str:
+    wait = ""
+    if exc.retry_after_seconds:
+        minutes = max(1, round(exc.retry_after_seconds / 60))
+        wait = f" Try again in about {minutes} minute{'s' if minutes != 1 else ''}."
+    scope = "daily " if exc.daily else ""
+    return (
+        f"The AI service's {scope}usage limit has been reached, so this question "
+        f"could not be answered.{wait} Nothing was guessed."
+    )
 
 
 def _elapsed_ms(started: float) -> int:

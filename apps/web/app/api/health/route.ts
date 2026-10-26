@@ -7,7 +7,7 @@
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const API_BASE_URL = process.env.API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE_URL = process.env.API_BASE_URL ?? "http://127.0.0.1:8100";
 const API_SHARED_SECRET = process.env.API_SHARED_SECRET ?? "";
 
 export async function GET() {

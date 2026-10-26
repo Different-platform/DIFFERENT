@@ -596,3 +596,23 @@ async def test_classifier_is_not_called_when_the_last_answer_has_no_computation(
 async def test_classifier_is_not_called_on_the_first_message(pipeline):
     await run(pipeline, "How is food insecurity measured?")
     assert pipeline["state"]["classifier_calls"] == 0
+
+
+async def test_usage_limit_is_reported_as_such_with_the_wait(pipeline, monkeypatch):
+    """'The language model did not respond' hid a spent quota behind a vague error."""
+    from services.api.llm.gateway import LLMRateLimitError
+
+    async def limited_route(question, *, gateway):
+        del question, gateway
+        raise LLMRateLimitError("cap", retry_after_seconds=582, daily=True)
+
+    monkeypatch.setattr(router, "classify", limited_route)
+
+    events = await run(pipeline)
+    error = next(e for e in events if e["type"] == "error")["message"]
+    assert "daily usage limit" in error
+    assert "about 10 minutes" in error
+    assert "did not respond" not in error
+    assert types_of(events)[-1] == "done"
+    # Recorded as a failed turn, not as if it had succeeded.
+    assert pipeline["state"]["logged"][0]["verdict"] is None

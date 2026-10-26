@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
+import { API_BASE_URL } from "@/lib/differ/api-stream";
 import { ask, USE_MOCK } from "@/lib/differ/ask";
 import { MOCK_CONVERSATIONS } from "@/lib/differ/mock-data";
 import type { Conversation, Message } from "@/lib/differ/types";
@@ -178,8 +179,7 @@ export function ConsolePage() {
       // Network failure or the API is down: say so instead of leaving the
       // input locked on a reply that will never finish.
       patchAssistant({
-        content:
-          "Couldn't reach the DIFFER API. Check that the backend is running and try again.",
+        content: `Couldn't reach the DIFFER API at ${API_BASE_URL}. Check that the backend is running and that nothing else is using that port.`,
         phase: "done",
       });
     } finally {

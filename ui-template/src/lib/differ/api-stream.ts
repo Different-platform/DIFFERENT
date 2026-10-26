@@ -12,7 +12,11 @@
 
 import type { StreamEvent } from "./mock-stream";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+// 127.0.0.1, not "localhost": browsers resolve localhost to IPv6 (::1) first,
+// so whatever else listens on ::1 at this port gets the request. Port 8000 was
+// taken by an unrelated Chroma container, which answered 404 with no CORS
+// headers and made the UI report "couldn't reach the API".
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8100";
 
 export interface AskOptions {
   conversationId?: string | null;
