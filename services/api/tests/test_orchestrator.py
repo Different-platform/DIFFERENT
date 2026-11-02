@@ -84,8 +84,9 @@ def pipeline(monkeypatch):
         "guidance_kwargs": None,
     }
 
-    async def fake_classify_followup(question, prior_q, prior_a, *, gateway):
+    async def fake_classify_followup(question, prior_q, prior_a, *, gateway, earlier=""):
         del question, prior_q, prior_a, gateway
+        state["classifier_earlier"] = earlier
         state["classifier_calls"] += 1
         return state["followup_kind"]
 
@@ -342,9 +343,10 @@ async def test_data_intent_with_verified_sql_returns_a_result(pipeline):
     sql_event = next(e for e in events if e["type"] == "sql")
     assert sql_event["sql"]["verified"] is True
     result_event = next(e for e in events if e["type"] == "result")
-    # Codes are labelled for the reader ("Yes (1)", not a bare 1).
-    assert result_event["result"]["columns"][0] == "FDSCAT4_A"
-    assert [row[0] for row in result_event["result"]["rows"]] == ["Yes (1)", "No (2)"]
+    # Codes are labelled for the reader ("Yes", not a bare 1), and the column
+    # is headed by what it is about, not by its variable code.
+    assert result_event["result"]["columns"][0] == "Description of FDSCAT4_A"
+    assert [row[0] for row in result_event["result"]["rows"]] == ["Yes", "No"]
     assert result_event["result"]["weight_variable"] == "WTFA_A"
     assert event_types.index("sql") < event_types.index("result")
     assert "sql_gen" in order and "execute" in order
@@ -611,6 +613,9 @@ async def test_research_guidance_is_answered_without_recomputing(pipeline):
     # The advice is about the saved computation.
     assert state["guidance_kwargs"]["sql"] == PRIOR_SQL
     assert state["guidance_kwargs"]["message"] == "How can I use this BMI in my research?"
+    # The conversation so far is passed on, so "why did it go up from 2022 to
+    # 2023?" can see both years' figures.
+    assert state["guidance_kwargs"]["earlier"] == state["history"]
     # Logged once, as guidance, against the SQL it is about.
     assert len(state["logged"]) == 1
     logged = state["logged"][0]

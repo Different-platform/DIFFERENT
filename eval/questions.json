@@ -110,9 +110,40 @@
       "question": "How can I use this BMI in my research?",
       "expect_verdict": "MEASURED",
       "expect_result": false,
-      "expect_text": ["standard error", "self-report"],
-      "reject_text": ["cannot be computed"],
+      "expect_text": ["height", "weight"],
+      "reject_text": ["cannot be computed", "point estimate", "cross-sectional", "noninstitutionalized", "non-institutionalized"],
       "note": "Regression: this was rewritten into a data question, re-ran the BMI query and repeated the same number. It must give research guidance (point estimate without a standard error, self-reported height and weight) and produce no new number."
+    },
+    {
+      "id": "w1",
+      "conversation": "why",
+      "question": "What's the weighted mean BMI for adults in 2023?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "expect_text": ["28.03"],
+      "reject_text": ["population-weighted", "WTFA_A"],
+      "note": "Plain-language summary: the number first, no jargon or variable codes in the prose. Sets up w3."
+    },
+    {
+      "id": "w2",
+      "conversation": "why",
+      "question": "BMI for 2022?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "expect_text": ["27.96"],
+      "note": "Follow-up that changes the year; sets up w3."
+    },
+    {
+      "id": "w3",
+      "conversation": "why",
+      "question": "What is the reason for the increase in BMI from 2022 to 2023?",
+      "expect_verdict": "MEASURED",
+      "expect_result": false,
+      "expect_text": ["27.96", "28.03", "chance"],
+      "reject_text": ["does not include any 2023", "point estimate", "cross-sectional", "PSTRAT"],
+      "note": "Regression from a screenshot: this got a wall of research caveats about 2022 alone and claimed there was no 2023 data. It must say the survey cannot show why, give both figures already shown, and say a small difference can be chance, with no new number."
     },
     {
       "id": "a1",

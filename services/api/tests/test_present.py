@@ -4,8 +4,24 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import re
+
+import pytest
+
 from services.api.domain import Hit, ValueLabel
 from services.api.rag.present import is_empty, present_result, variables_in
+
+#: Wording a reader without a statistics background should never meet.
+_JARGON = re.compile(
+    r"population-weighted|weighted mean|derived|sentinel|universe|"
+    r"Excluded as missing|\b[A-Z][A-Z0-9]+_[A-Z]+\b",
+)
+
+
+def assert_plain(summary: str) -> None:
+    """No statistics jargon and no variable codes in the prose."""
+    found = _JARGON.findall(summary)
+    assert not found, f"jargon in summary: {found}"
 
 
 def make_hit(name, description, labels, universe=None):
@@ -60,14 +76,15 @@ def test_distribution_codes_become_labels_and_fractions_become_percentages():
         hits=[BMICAT],
         year=2023,
     )
-    assert presented.columns == ["BMICAT_A", "Percent of adults (weighted)"]
-    assert presented.rows[0] == ["Underweight (1)", "1.6%"]
-    assert presented.rows[2] == ["Overweight (3)", "34.0%"]
+    assert presented.columns == ["Categorical Body Mass Index", "Percent of U.S. adults"]
+    assert presented.rows[0] == ["Underweight", "1.6%"]
+    assert presented.rows[2] == ["Overweight", "34.0%"]
     # The reader gets the finding, the exclusions, and the weighting, in words.
     assert "Underweight 1.6%" in presented.summary
     assert "largest group is Overweight" in presented.summary
-    assert "Excluded as missing: Unknown." in presented.summary
-    assert "WTFA_A" in presented.summary
+    assert "People with no usable answer (unknown) were left out." in presented.summary
+    assert "represent all U.S. adults" in presented.summary
+    assert_plain(presented.summary)
 
 
 def test_derived_scalar_is_described_as_derived():
@@ -84,11 +101,40 @@ def test_derived_scalar_is_described_as_derived():
         year=2023,
     )
     assert presented.rows == [[29.87]]
-    assert presented.columns == ["Weighted mean"]
-    assert "29.87" in presented.summary
-    assert "derived" in presented.summary
-    assert "HEIGHTTC_A" in presented.summary and "WEIGHTLBTC_A" in presented.summary
-    assert "Refused" in presented.summary  # what was excluded is stated
+    assert presented.columns == ["Average"]
+    assert presented.summary.startswith("The average BMI for U.S. adults in 2023 was 29.87.")
+    # Says what BMI is and where it came from, in words.
+    assert "compares a person's weight with their height" in presented.summary
+    assert "height and weight people reported" in presented.summary
+    # And what the number means on the standard scale.
+    assert "falls in the overweight range" in presented.summary
+    assert "refused" in presented.summary  # what was excluded is stated
+    assert_plain(presented.summary)
+
+
+@pytest.mark.parametrize(
+    ("value", "band"),
+    [("18.4", "underweight"), ("18.5", "healthy weight"), ("24.99", "healthy weight"),
+     ("25", "overweight"), ("29.99", "overweight"), ("30", "obese")],
+)
+def test_bmi_band_uses_the_standard_cut_offs(value, band):
+    from services.api.rag.present import _bmi_band
+
+    assert _bmi_band(Decimal(value)) == band
+
+
+def test_a_derived_measure_other_than_bmi_gets_no_bmi_wording():
+    other = make_hit("HHINC_A", "Household income", [])
+    sql = (
+        "SELECT SUM(HHINC_A / AGEP_A * WTFA_A) / SUM(WTFA_A) AS weighted_mean "
+        "FROM survey_2023"
+    )
+    age = make_hit("AGEP_A", "Age of SA (top coded)", [])
+    presented = present_result(
+        ["weighted_mean"], [[3.2]], sql=sql, hits=[other, age], year=2023
+    )
+    assert "BMI" not in presented.summary
+    assert "worked out from household income and age" in presented.summary
 
 
 def test_single_variable_mean_is_not_called_derived():
@@ -101,8 +147,8 @@ def test_single_variable_mean_is_not_called_derived():
         hits=[age],
         year=2023,
     )
-    assert "derived" not in presented.summary
-    assert "48.1" in presented.summary
+    assert "worked out from" not in presented.summary
+    assert "The average age for U.S. adults in 2023 was 48.1" in presented.summary
 
 
 def test_assumed_year_is_disclosed():
@@ -185,9 +231,9 @@ def test_two_way_table_labels_both_columns_and_says_within_group():
         hits=[SEX, BMICAT],
         year=2023,
     )
-    assert presented.columns[:2] == ["SEX_A", "BMICAT_A"]
-    assert presented.rows[0] == ["Male (1)", "Underweight (1)", "2.0%"]
-    assert "within each SEX_A" in presented.summary
+    assert presented.columns[:2] == ["Sex", "Categorical Body Mass Index"]
+    assert presented.rows[0] == ["Male", "Underweight", "2.0%"]
+    assert "within each sex group" in presented.summary
     assert "Male: Underweight 2.0%, Obese 98.0%" in presented.summary
     assert "Female: Underweight 4.0%, Obese 96.0%" in presented.summary
     assert "within each group" in presented.summary
@@ -205,7 +251,7 @@ def test_joint_two_way_table_is_described_as_shares_of_everyone():
         hits=[SEX, BMICAT],
         year=2023,
     )
-    assert "each combination of SEX_A and BMICAT_A" in presented.summary
+    assert "each combination of sex and categorical Body Mass Index" in presented.summary
     assert "Male, Underweight 2.0%" in presented.summary
 
 
@@ -221,9 +267,9 @@ def test_share_in_one_category_says_which_category():
         ["proportion"], [[0.338]], sql=SHARE_SQL, hits=[BMICAT], year=2023
     )
     assert presented.rows == [["33.8%"]]
-    assert "33.8% of U.S. adults in 2023" in presented.summary
+    assert "About 33.8% of U.S. adults in 2023" in presented.summary
     assert '"Obese"' in presented.summary
-    assert "BMICAT_A" in presented.summary
+    assert_plain(presented.summary)
 
 
 def test_category_share_by_group_is_not_called_a_distribution():
@@ -239,9 +285,10 @@ def test_category_share_by_group_is_not_called_a_distribution():
         hits=[SEX, BMICAT],
         year=2023,
     )
-    assert presented.rows == [["Male (1)", "34.2%"], ["Female (2)", "33.5%"]]
+    assert presented.rows == [["Male", "34.2%"], ["Female", "33.5%"]]
     assert '"Obese"' in presented.summary
-    assert "within each" in presented.summary
+    assert "within each sex group" in presented.summary
+    assert "do not add up to 100%" in presented.summary
     assert "Male 34.2%, Female 33.5%" in presented.summary
     # These do not sum to 100%, so announcing a "largest group" would mislead.
     assert "largest group" not in presented.summary

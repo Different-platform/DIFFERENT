@@ -45,16 +45,19 @@ gave a computed statistic. Classify the researcher's NEWEST message.
 "how did you calculate that", "why that formula", "walk me through it", \
 "show your work", "can you elaborate".
 
-"guidance": asks how to USE, interpret, report, cite, or rely on the previous \
-figure, or what its limits are, without asking for a different computation: \
-"how can I use this in my research", "what does this mean for my study", \
-"how should I interpret this", "is this good enough for a paper", "how do I \
-cite this", "what are the limitations", "can I compare this with other \
-studies".
+"guidance": asks about figures ALREADY SHOWN in the conversation, without \
+asking for a new computation: how to use, interpret, report, cite, or rely on \
+them; what they mean; what their limits are; or why they differ or changed. \
+"how can I use this in my research", "what does this mean", "how should I \
+interpret this", "is this good enough for a paper", "how do I cite this", \
+"what are the limitations", "is that a big difference", "why did it go up \
+from 2022 to 2023" (when both years were already shown), "what explains the \
+increase", "is this good or bad".
 
 "new": asks for something new or a change to the question: a different \
-measure, year, group, breakdown, or format. "what about 2021", "can you do it \
-categorically", "break it down by sex", "now for women", "how is food \
+measure, year, group, breakdown, or format, or a comparison with a year that \
+has not been shown yet. "what about 2021", "can you do it categorically", \
+"break it down by sex", "now for women", "compare it with 2019", "how is food \
 insecurity measured" are all "new".
 
 Respond with JSON only: {"kind": "explain"}, {"kind": "guidance"} or \
@@ -123,6 +126,7 @@ async def classify(
     prior_answer: str,
     *,
     gateway: LLMGateway,
+    earlier: str = "",
 ) -> FollowUpKind:
     """What the newest message wants, given a previous computed answer.
 
@@ -134,6 +138,7 @@ async def classify(
     prompt = (
         f"Previous question: {prior_question}\n\n"
         f"Assistant's previous answer: {prior_answer[:700]}\n\n"
+        f"Earlier figures shown in this conversation: {earlier or '(none)'}\n\n"
         f"Researcher's newest message: {question}"
     )
     try:

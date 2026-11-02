@@ -20,30 +20,32 @@ from decimal import Decimal, InvalidOperation
 
 from services.api.domain import Hit
 from services.api.llm.gateway import LLMGateway, Message
+from services.api.rag.style import PLAIN_LANGUAGE
 
 SYSTEM_PROMPT = """\
-You explain to a health researcher how a statistic you already computed from \
-U.S. National Health Interview Survey (NHIS) data was produced.
+You explain how a number you already worked out from the U.S. National Health \
+Interview Survey (NHIS) was produced, to someone who may not be a researcher.
 
 You are given the question, the summary you already gave, the exact SQL that \
-ran, and codebook details for the variables it used. Write two or three short \
-paragraphs of plain prose covering:
-- what the figure means and which population it describes;
-- how it was calculated, step by step, read from the SQL (name the formula if \
-there is one, such as BMI = 703 x weight in pounds / height in inches squared);
-- why respondents with missing-data codes were left out, and which codes;
-- what the survey weight does and why an unweighted figure would be wrong;
-- one or two honest limits of the measure, only where they are real (for \
-example self-reported height and weight, or a figure derived by formula rather \
-than published as a single NHIS variable).
+ran, and codebook details for the variables it used. Read the SQL and explain \
+it in everyday words, one or two sentences each:
+- what the number means and who it describes;
+- how it was worked out, as simple steps (give the formula in words if there \
+is one, for example "weight in pounds times 703, divided by height in inches \
+squared");
+- that people with no usable answer were left out, and why that matters;
+- that the survey's weights adjust the result so it represents all U.S. \
+adults, not only the people interviewed;
+- one honest limit, only if it is real (for example that people reported \
+their own height and weight).
 
 Rules:
 - Use only facts in the material provided. Do not state any number that is \
 not in it: no sample sizes, no other statistics, no page numbers.
 - Do not recompute or restate the result with different precision.
 - The statistic WAS computed. Never say it cannot be computed.
-- No headings, no bullet lists.\
-"""
+
+""" + PLAIN_LANGUAGE.replace("about 120 words", "about 150 words")
 
 _NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
@@ -162,9 +164,9 @@ def build_prompt(
 def fallback(summary: str) -> str:
     """Used when no grounded explanation can be produced."""
     return (
-        f"{summary} The query shown above is exactly what produced this figure: "
-        f"it weights every respondent by the NHIS survey weight (WTFA_A) and "
-        f"leaves out the missing-data codes named in the summary."
+        f"{summary}\n\nThe query shown above is exactly what produced this "
+        f"number. It adjusts each person's answer with the survey's weights "
+        f"and leaves out people with no usable answer."
     )
 
 

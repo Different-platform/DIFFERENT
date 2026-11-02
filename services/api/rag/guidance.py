@@ -1,17 +1,19 @@
-"""Advise on using a statistic that was already computed.
+"""Answer questions about numbers that were already worked out.
 
-"How can I use this in my research?" asks what the figure is good for, what it
-cannot support, and what to report. The useful answer depends on facts about
-this particular computation: which weight it used, which year, whether the
-measure was derived by formula, which missing-data codes were dropped, and
-that no standard error was computed. Those facts are written here as fixed
-research notes built from the saved SQL and the codebook, so the cautions are
-true for the figure and do not depend on the model remembering them.
+"How can I use this in my research?", "why did BMI go up from 2022 to 2023?",
+and "is that a big difference?" are questions about results already shown.
+The useful answer depends on facts about those results: that the survey
+records what people reported but not why, that a small difference between
+years can be chance, that BMI came from self-reported height and weight,
+that no margin of error was calculated. Those facts are written here as fixed
+notes built from the saved SQL and the codebook, so the cautions are true for
+the number and do not depend on the model remembering them.
 
-The model turns the notes into an answer to the researcher's actual question.
-The same number check as rag/explain.py applies: every number in the reply
-must appear in the material it was given. A reply that fails twice falls back
-to the notes themselves, which always make a complete, correct answer.
+The model turns the notes and the conversation so far into a short,
+plain-language answer to the question actually asked. The same number check
+as rag/explain.py applies: every number in the reply must appear in the
+material it was given, so it cannot compute a new difference or invent a
+cause. A reply that fails twice falls back to the notes themselves.
 """
 
 from __future__ import annotations
@@ -21,32 +23,44 @@ import re
 from services.api.domain import Hit
 from services.api.llm.gateway import LLMGateway, Message
 from services.api.rag import derivations, explain
+from services.api.rag.style import PLAIN_LANGUAGE
 
 SYSTEM_PROMPT = """\
-You advise a health researcher on how to use a statistic you already computed \
-from U.S. National Health Interview Survey (NHIS) data.
+You answer a follow-up question about numbers you already worked out from the \
+U.S. National Health Interview Survey (NHIS). The reader may be a student, a \
+journalist, a member of the public, or a researcher.
 
-You are given the researcher's message, the question the figure answered, the \
-summary you already gave, the exact SQL that ran, codebook details for the \
-variables it used, and research notes that are true for this figure.
+You are given their message, the earlier messages in this conversation (which \
+contain the numbers already shown), the most recent number's question, summary \
+and SQL, codebook details, and notes that are true for these numbers.
 
-Answer the researcher's message directly in two to four short paragraphs of \
-plain prose. Cover what the figure is suitable for (for example describing the \
-U.S. adult population, giving background for a study, or checking against \
-published estimates), what it cannot support without further work (for \
-example significance tests, margins of error, or causal claims), and what to \
-report in a methods section. Base every caution on the research notes, and \
-put the ones that matter most for the message first.
+Answer what they actually asked, starting in the first sentence.
+- If they ask WHY a number changed or differs: say plainly that the survey \
+shows what people reported, not the reasons. Give the numbers already shown \
+for each year or group being compared, and say whether the difference looks \
+small. Explain that a small difference can happen by chance. Do not guess at \
+causes.
+- If they ask how to USE the number, for research or otherwise: say what it is \
+good for (describing U.S. adults, background for a study or article, comparing \
+with other published figures) and what it cannot do on its own (prove a cause, \
+or show that a difference is real). Then add one last sentence starting "For \
+a paper:" that names the survey file to cite and says a margin of error needs \
+survey software; that sentence may name PSTRAT and PPSU.
+- Otherwise, answer the message directly from the material.
+- Use only the notes that matter for this message, usually two or three.
 
 Rules:
 - Use only facts in the material provided. Do not state any number that is \
-not in it: no sample sizes, cut-offs, other statistics, or page numbers.
-- Do not recompute the result or restate it with different precision.
-- The statistic WAS computed. Never say it cannot be computed.
+not in it. Do not calculate new numbers such as differences or percentage \
+changes; say "slightly higher" or "about the same" instead.
+- The statistics WERE computed. Never say they cannot be computed.
 - State each caution exactly as strongly as the notes do; do not widen it.
-- No headings, no bullet lists, no markdown. Separate paragraphs with a blank \
-line.\
-"""
+
+""" + PLAIN_LANGUAGE
+
+#: How much of the conversation to show the model: the last few exchanges
+#: hold the numbers a "why did it change" question is about.
+EARLIER_MESSAGES = 6
 
 _WEIGHT = re.compile(r"\b(WTFA_SA|WTFA_A)\b", re.IGNORECASE)
 
@@ -68,10 +82,11 @@ def _bmi_was_derived(sql: str) -> bool:
 
 
 def research_notes(*, sql: str, variables: list[Hit]) -> list[str]:
-    """True statements about this figure that a researcher needs to know.
+    """True statements about this number, most widely useful first.
 
     Built only from the saved SQL and codebook details, so each note can be
-    checked against what actually ran.
+    checked against what actually ran. The last note is the technical one, for
+    a researcher writing a methods section.
     """
     weight = _weight_of(sql)
     year = explain.year_of(sql)
@@ -79,81 +94,89 @@ def research_notes(*, sql: str, variables: list[Hit]) -> list[str]:
     notes: list[str] = []
 
     notes.append(
-        f"The figure is a population-weighted point estimate using the NHIS "
-        f"sample-adult weight {weight}. No standard error or confidence "
-        f"interval was computed, because the survey's design variables "
-        f"(PSTRAT for strata and PPSU for primary sampling units) were not "
-        f"used. To report a margin of error, test a difference, or fit a "
-        f"model, re-estimate it in survey software with strata PSTRAT, "
-        f"clusters PPSU and weight {weight}, for example the R survey package, "
-        f"Stata's svy commands, or SAS PROC SURVEYMEANS."
+        "The survey records what people reported when they were interviewed. "
+        "It does not record the reasons behind a number, so on its own it "
+        "cannot explain why a figure went up or down, or what caused it."
     )
-
-    if year is not None:
-        notes.append(
-            f"It describes U.S. civilian noninstitutionalized adults in {year}, "
-            f"at one point in time. A cross-sectional estimate like this can "
-            f"describe levels and prevalence and give context for a study; it "
-            f"cannot show cause and effect or change within the same people."
-        )
+    notes.append(
+        "Each year the survey interviews a different sample of people, so a "
+        "small difference between two years or two groups can happen by "
+        "chance. No margin of error was calculated here, so this tool cannot "
+        "say whether a small difference is real."
+    )
 
     if _bmi_was_derived(sql):
         notes.append(
-            "BMI here is not a variable NHIS publishes. It was derived from "
-            "self-reported height and weight as 703 x weight in pounds / "
-            "(height in inches) squared. People tend to under-report weight "
-            "and over-report height, so BMI from self-report usually runs "
-            "lower than BMI from measured height and weight; say so if you "
-            "compare it with measured data such as NHANES."
+            "BMI was worked out from the height and weight people reported "
+            "themselves (703 x weight in pounds, divided by height in inches "
+            "squared). People tend to report a little less weight and a little "
+            "more height than they really have, so BMI from self-reports "
+            "usually comes out lower than BMI from measured height and weight."
         )
+
+    when = f"in {year}" if year is not None else "in that year"
+    notes.append(
+        f"The number is adjusted with the survey's weights so it represents "
+        f"U.S. adults living in households {when}, not only the people "
+        f"interviewed. It is a snapshot of that year; the survey does not "
+        f"follow the same people over time."
+    )
 
     missing: list[str] = []
     for hit in variables:
         for label in hit.sentinel_labels:
-            text = (label.label or "").strip()
+            text = (label.label or "").strip().lower()
             if text and text not in missing:
                 missing.append(text)
-    if missing:
-        notes.append(
-            f"Respondents with a missing-data code on any variable used "
-            f"({', '.join(missing)}) were left out, so the estimate covers "
-            f"adults with valid answers. State this exclusion in your methods."
-        )
-    else:
-        notes.append(
-            "Respondents with missing-data codes on the variables used were "
-            "left out, so the estimate covers adults with valid answers. State "
-            "this exclusion in your methods."
-        )
+    reasons = f" ({', '.join(missing)})" if missing else ""
+    notes.append(
+        f"People with no usable answer{reasons} were left out, so the number "
+        f"describes adults who gave a usable answer."
+    )
+
+    notes.append(
+        "Survey years 2019 to 2023 use the same questionnaire, so they can "
+        "generally be compared after checking that the question was asked the "
+        "same way each year. Years before 2019 used an older questionnaire and "
+        "are not directly comparable. In 2020 most interviews were done by "
+        "telephone because of the COVID-19 pandemic, so 2020 figures need "
+        "extra caution."
+    )
 
     source = (
-        f"National Center for Health Statistics, National Health Interview "
-        f"Survey, {year} Sample Adult public-use file"
+        f"the National Health Interview Survey {year} Sample Adult public-use "
+        f"file from the National Center for Health Statistics"
         if year is not None
-        else "National Center for Health Statistics, National Health Interview "
-        "Survey, Sample Adult public-use file"
+        else "the National Health Interview Survey Sample Adult public-use "
+        "file from the National Center for Health Statistics"
     )
-    used = f" and name the variables used ({', '.join(names)})" if names else ""
+    used = f", naming the variables used ({', '.join(names)})" if names else ""
     notes.append(
-        f"Cite the data as {source}{used}. The exact SQL shown with the "
-        f"original answer documents how the figure was produced."
-    )
-
-    notes.append(
-        "Survey years 2019 to 2023 all use the questionnaire NHIS introduced "
-        "in its 2019 redesign, so they can generally be compared once you "
-        "have checked that each variable's wording and response options are "
-        "the same in each year's codebook. Estimates from 2018 or earlier are "
-        "not directly comparable because of that redesign. In 2020 interviews "
-        "moved largely to telephone during the COVID-19 pandemic, so NCHS "
-        "advises caution when comparing 2020 estimates with other years."
+        f"For a paper: cite {source}{used}. To add a margin of error or test a "
+        f"difference, re-run the estimate in survey software (for example the "
+        f"R survey package, Stata's svy commands, or SAS PROC SURVEYMEANS) with "
+        f"strata PSTRAT, clusters PPSU and weight {weight}."
     )
     return notes
 
 
 def fallback(notes: list[str]) -> str:
-    """Used when no grounded reply can be produced: the notes themselves."""
-    return "Here is how to use this figure in research.\n\n" + "\n\n".join(notes)
+    """Used when no grounded reply can be produced.
+
+    The three most widely useful notes plus the one for researchers, rather
+    than all of them: a wall of caveats is the unreadable answer this module
+    exists to replace.
+    """
+    chosen = notes[:3] + ([notes[-1]] if len(notes) > 3 else [])
+    return "Here is what this number can and cannot tell you.\n\n" + "\n\n".join(chosen)
+
+
+def _earlier_text(earlier: list[Message]) -> str:
+    lines = [
+        f"{'Reader' if m.role == 'user' else 'Assistant'}: {m.content}"
+        for m in earlier[-EARLIER_MESSAGES:]
+    ]
+    return "\n\n".join(lines) or "(none)"
 
 
 def build_prompt(
@@ -164,18 +187,20 @@ def build_prompt(
     sql: str,
     variables: list[Hit],
     notes: list[str],
+    earlier: list[Message],
     feedback: str | None = None,
 ) -> str:
     details = "\n".join(explain.describe_variable(v) for v in variables) or "(none)"
     prompt = (
-        f"The researcher's message: {message}\n\n"
-        f"The question the figure answered: {prior_question}\n\n"
-        f"Summary you already gave:\n{summary}\n\n"
+        f"Their message: {message}\n\n"
+        f"Earlier in this conversation:\n{_earlier_text(earlier)}\n\n"
+        f"The most recent number answered: {prior_question}\n\n"
+        f"Summary already given for it:\n{summary}\n\n"
         f"The exact SQL that ran:\n{sql}\n\n"
         f"Codebook details for the variables it used:\n{details}\n\n"
-        f"Research notes (true for this figure):\n"
+        f"Notes (true for these numbers):\n"
         + "\n".join(f"- {note}" for note in notes)
-        + "\n\nAnswer the researcher's message."
+        + "\n\nAnswer their message."
     )
     if feedback:
         prompt += f"\n\n{feedback}"
@@ -190,8 +215,10 @@ async def compose(
     sql: str,
     variables: list[Hit],
     gateway: LLMGateway,
+    earlier: list[Message] | None = None,
 ) -> str:
-    """A grounded reply, or the research notes if none can be made."""
+    """A grounded reply, or the most useful notes if none can be made."""
+    earlier = list(earlier or [])
     notes = research_notes(sql=sql, variables=variables)
     source = "\n".join(
         [
@@ -199,6 +226,7 @@ async def compose(
             prior_question,
             summary,
             sql,
+            _earlier_text(earlier),
             *[explain.describe_variable(v) for v in variables],
             *notes,
         ]
@@ -217,6 +245,7 @@ async def compose(
                         sql=sql,
                         variables=variables,
                         notes=notes,
+                        earlier=earlier,
                         feedback=feedback,
                     ),
                 )
@@ -232,6 +261,7 @@ async def compose(
             feedback = (
                 "Your previous reply contained numbers that are not in the "
                 f"material above ({', '.join(bad)}). Rewrite it using only "
-                "numbers that appear in the material."
+                "numbers that appear in the material, and describe any "
+                "difference in words instead of calculating it."
             )
     return fallback(notes)

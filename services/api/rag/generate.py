@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator
 
 from services.api.domain import Citation, Hit, Verdict
 from services.api.llm.gateway import LLMGateway, Message
+from services.api.rag.style import PLAIN_LANGUAGE
 
 #: NHIS variable names are upper-case, 3+ chars, usually suffixed `_A`.
 _VARIABLE_TOKEN = re.compile(r"\b([A-Z][A-Z0-9]{2,}(?:_[A-Z])?)\b")
@@ -58,8 +59,13 @@ everyone.
 - If the provided variables only partly answer the question, say what is \
 missing rather than filling the gap.
 
-Write two to four sentences of plain prose for an expert reader. No bullet \
-lists, no headings, no restatement of the question.\
+Write two to four sentences. Do not restate the question.
+
+""" + PLAIN_LANGUAGE + """
+- Variable codes ARE allowed here, because the question is about what the \
+survey records: describe each variable in plain words first, then give its \
+code once in parentheses, for example "whether a doctor ever said they had \
+diabetes (DIBEV_A)".\
 """
 
 

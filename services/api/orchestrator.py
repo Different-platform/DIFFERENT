@@ -129,8 +129,19 @@ class Orchestrator:
                 prior_question = next(
                     (m.content for m in reversed(history) if m.role == "user"), ""
                 )
+                # Earlier answers let "why did it go up from 2022 to 2023?" be
+                # recognised as a question about figures already shown.
+                earlier = " | ".join(
+                    m.content[:200]
+                    for m in history[:-1][-guidance.EARLIER_MESSAGES:]
+                    if m.role == "assistant"
+                )
                 kind = await followup.classify(
-                    question, prior_question, prior["content"], gateway=self.gateway
+                    question,
+                    prior_question,
+                    prior["content"],
+                    gateway=self.gateway,
+                    earlier=earlier,
                 )
                 if kind == "explain":
                     async for event in self._explain_previous(
@@ -151,6 +162,7 @@ class Orchestrator:
                         conversation_uuid,
                         started,
                         sql_state,
+                        history,
                     ):
                         yield event
                     return
@@ -378,13 +390,16 @@ class Orchestrator:
         conversation_uuid,
         started: float,
         sql_state: dict,
+        history: list | None = None,
     ) -> AsyncIterator[dict]:
-        """Advise on using the last computed statistic in research.
+        """Answer a question about figures already shown ("how do I use this",
+        "why did it go up").
 
         No retrieval, no judge, no new SQL, and no repeat of the SQL panel or
-        result table that the previous answer already shows: the reply is
-        advice, grounded in research notes built from the saved SQL and
-        checked for numbers that were not in its material (rag/guidance.py).
+        result table that the previous answer already shows. The reply is
+        grounded in notes built from the saved SQL plus the earlier messages,
+        and checked for numbers that were not in its material
+        (rag/guidance.py).
         """
         sql = prior["generated_sql"]
         verdict = prior.get("verdict") or "MEASURED"
@@ -403,6 +418,7 @@ class Orchestrator:
             sql=sql,
             variables=variables,
             gateway=self.gateway,
+            earlier=list(history or []),
         )
         for chunk in _chunk(text):
             yield events.token(chunk)

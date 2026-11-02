@@ -140,8 +140,9 @@ def _label_for(value: Any, hit: Hit) -> str | None:
 
 
 def _coded_cell(value: Any, hit: Hit) -> str:
-    label = _label_for(value, hit)
-    return f"{label} ({_code_text(value)})" if label else _code_text(value)
+    # The label alone: "Obese", not "Obese (4)". The code is in the SQL panel
+    # for anyone who needs it, and it is noise to everyone else.
+    return _plain_label(value, hit)
 
 
 def _plain_label(value: Any, hit: Hit) -> str:
@@ -179,12 +180,64 @@ def _case_target(sql: str, hits: list[Hit]) -> tuple[Hit, str] | None:
     return (hit, label) if hit is not None and label else None
 
 
-def _describe(hit: Hit) -> str:
-    return f"{hit.variable_name} ({hit.description})" if hit.description else hit.variable_name
+#: Codebook boilerplate that means nothing to a reader of the answer.
+_DESCRIPTION_NOISE: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r",?\s*public use\b", re.IGNORECASE), ""),
+    (re.compile(r"\s*\((?:top|bottom)[\s-]?coded\)", re.IGNORECASE), ""),
+    (re.compile(r"\s+of\s+(?:the\s+)?(?:SA|sample adult)\b", re.IGNORECASE), ""),
+    (re.compile(r"^(?:SA|sample adult(?:'s)?)\s+", re.IGNORECASE), ""),
+    (re.compile(r"\s+recode\b", re.IGNORECASE), ""),
+    (re.compile(r"^adult\s+", re.IGNORECASE), ""),
+    (re.compile(r"\s{2,}"), " "),
+)
+
+#: Variables BMI is worked out from (see rag/derivations.py).
+_BMI_INPUTS = frozenset({"HEIGHTTC_A", "WEIGHTLBTC_A"})
+
+
+def _topic(hit: Hit) -> str:
+    """What a variable is about, in words: "Sex of Sample Adult" -> "sex".
+
+    The variable code stays on the citation card; prose uses the topic.
+    """
+    text = (hit.description or "").strip()
+    for pattern, replacement in _DESCRIPTION_NOISE:
+        text = pattern.sub(replacement, text)
+    text = text.strip(" ,.;")
+    if not text:
+        return hit.variable_name
+    if len(text) > 1 and not text[1].isupper():  # leave acronyms like "BMI"
+        text = text[0].lower() + text[1:]
+    return text
+
+
+def _heading(hit: Hit) -> str:
+    topic = _topic(hit)
+    return topic[0].upper() + topic[1:] if topic else hit.variable_name
 
 
 def _join(hits: list[Hit]) -> str:
-    return " and ".join(_describe(hit) for hit in hits)
+    return " and ".join(_topic(hit) for hit in hits)
+
+
+def _bmi_band(value: Any) -> str | None:
+    """The standard adult BMI category a value falls in (CDC cut-offs)."""
+    number = _to_decimal(value)
+    if number is None:
+        return None
+    if number < Decimal("18.5"):
+        return "underweight"
+    if number < 25:
+        return "healthy weight"
+    if number < 30:
+        return "overweight"
+    return "obese"
+
+
+def _or_list(items: list[str]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " or " + items[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -255,13 +308,13 @@ def present_result(
     headers: list[str] = []
     for index, name in enumerate(columns):
         if index in coded:
-            headers.append(coded[index].variable_name.upper())
+            headers.append(_heading(coded[index]))
         elif kinds[index] == "percent":
-            headers.append("Percent of adults (weighted)")
+            headers.append("Percent of U.S. adults")
         elif kinds[index] == "mean":
-            headers.append("Weighted mean")
+            headers.append("Average")
         elif kinds[index] == "count":
-            headers.append("Estimated adults (weighted count)")
+            headers.append("Estimated number of U.S. adults")
         else:
             headers.append(name.replace("_", " ").capitalize())
 
@@ -322,7 +375,7 @@ def _summarize(
             [_plain_label(raw[i], coded[i]) for i in order] for raw in raw_rows
         ]
         values = [shown[metric] for shown in shown_rows]
-        names = [coded[i].variable_name for i in order]
+        names = [_topic(coded[i]) for i in order]
         pivot = next(
             (
                 position
@@ -339,9 +392,9 @@ def _summarize(
             listing = "; ".join(f"{key}: {', '.join(parts)}" for key, parts in groups.items())
             other = [coded[i] for j, i in enumerate(order) if j != pivot]
             sentences.append(
-                f"Among {scope} (population-weighted), the distribution of "
-                f"{_join(other)} within each {_describe(coded[order[pivot]])} "
-                f"group is: {listing}. Percentages add up to 100% within each group."
+                f"Among {scope}, here is how {_join(other)} breaks down within "
+                f"each {_topic(coded[order[pivot]])} group: {listing}. "
+                f"Percentages add up to 100% within each group."
             )
         elif metric_kind == "percent":
             listing = "; ".join(
@@ -350,7 +403,7 @@ def _summarize(
             )
             sentences.append(
                 f"Share of {scope} in each combination of {' and '.join(names)} "
-                f"(shares add up to 100% across all combinations): {listing}."
+                f"(all the shares together add up to 100%): {listing}."
             )
         else:
             listing = "; ".join(
@@ -377,14 +430,14 @@ def _summarize(
             # its group, so they do not add up to 100% and there is no
             # "largest group" to announce.
             sentences.append(
-                f"Among {scope} (population-weighted), the share classified as "
-                f"\"{target[1]}\" on {_describe(target[0])}, within each "
-                f"{_describe(subject)} group: {listing}."
+                f"Share of {scope} in the \"{target[1]}\" group for "
+                f"{_topic(target[0])}, shown separately within each "
+                f"{_topic(subject)} group: {listing}. Each figure is a share of "
+                f"its own group, so they do not add up to 100%."
             )
         elif metric_kind == "percent":
             sentences.append(
-                f"Among {scope} (population-weighted), the distribution of "
-                f"{_describe(subject)} is: {listing}."
+                f"Here is how {scope} break down by {_topic(subject)}: {listing}."
             )
             raw_values = [_to_decimal(raw[metric]) for raw in raw_rows]
             known = [v for v in raw_values if v is not None]
@@ -404,35 +457,48 @@ def _summarize(
         elif metric_kind == "mean":
             what = _join(measure_vars) if measure_vars else "the measure"
             sentences.append(
-                f"The population-weighted mean of {what} for {scope}, by "
-                f"{_describe(subject)}: {listing}."
+                f"The average {what} for {scope}, by {_topic(subject)}: {listing}."
             )
         else:
             sentences.append(
-                f"Estimated results for {scope} by {_describe(subject)}: {listing}."
+                f"Estimated results for {scope} by {_topic(subject)}: {listing}."
             )
     elif len(shown_rows) == 1 and metric is not None and len(columns) == 1:
         value = shown_rows[0][metric]
-        if metric_kind == "mean" and derived:
+        used_names = {hit.variable_name.upper() for hit in used}
+        if metric_kind == "mean" and derived and _BMI_INPUTS <= used_names:
+            sentences.append(f"The average BMI for {scope} was {value}.")
             sentences.append(
-                f"The population-weighted mean for {scope} is {value}, computed "
-                f"from {_join(measure_vars)}. NHIS publishes no single variable "
-                f"for this, so it is derived with the formula shown in the query."
+                "BMI (body mass index) compares a person's weight with their "
+                "height. NHIS does not publish it as a single number, so it was "
+                "worked out from the height and weight people reported."
+            )
+            band = _bmi_band(value)
+            if band:
+                sentences.append(
+                    "On the standard adult BMI scale used by the CDC, under 18.5 "
+                    "is underweight, 18.5 to 24.9 is a healthy weight, 25 to "
+                    f"29.9 is overweight and 30 or more is obese, so this average "
+                    f"falls in the {band} range."
+                )
+        elif metric_kind == "mean" and derived:
+            sentences.append(
+                f"The average for {scope} was {value}. NHIS does not publish "
+                f"this as a single number, so it was worked out from "
+                f"{_join(measure_vars)}."
             )
         elif metric_kind == "mean":
             what = _join(measure_vars) if measure_vars else "the measure"
-            sentences.append(
-                f"The population-weighted mean of {what} for {scope} is {value}."
-            )
+            sentences.append(f"The average {what} for {scope} was {value}.")
         elif metric_kind == "percent" and target is not None:
             sentences.append(
-                f"An estimated {value} of {scope} are classified as "
-                f"\"{target[1]}\" on {_describe(target[0])}."
+                f"About {value} of {scope} were in the \"{target[1]}\" group "
+                f"for {_topic(target[0])}."
             )
         elif metric_kind == "percent":
-            sentences.append(f"The estimated share of {scope} is {value}.")
+            sentences.append(f"The share of {scope} was {value}.")
         elif metric_kind == "count":
-            sentences.append(f"The estimated number of adults is {value}.")
+            sentences.append(f"An estimated {value} {scope}.")
         else:
             sentences.append(f"The result for {scope} is {value}.")
     else:
@@ -444,22 +510,23 @@ def _summarize(
     excluded: list[str] = []
     for hit in used:
         for vl in hit.sentinel_labels:
-            text = vl.label.strip()
+            text = vl.label.strip().lower()
             if text and text not in excluded:
                 excluded.append(text)
     if excluded:
         sentences.append(
-            "Excluded as missing: " + ", ".join(excluded[:_MAX_EXCLUSION_LABELS]) + "."
+            "People with no usable answer ("
+            + _or_list(excluded[:_MAX_EXCLUSION_LABELS])
+            + ") were left out."
         )
 
     focus = group_vars[0] if group_vars else (measure_vars[0] if measure_vars else None)
     universe = (focus.universe_description or "").strip() if focus else ""
     if universe and universe.lower().rstrip(".") != _GENERIC_UNIVERSE:
-        sentences.append(f"This was asked of: {universe}.")
+        sentences.append(f"Only some adults were asked this question: {universe}.")
 
     sentences.append(
-        "Estimates use the NHIS final annual sample-adult weight (WTFA_A), so "
-        "they describe the U.S. adult population rather than only the people "
-        "surveyed."
+        "The numbers are adjusted with the survey's weights so they represent "
+        "all U.S. adults, not just the people who took the survey."
     )
     return " ".join(sentences)
