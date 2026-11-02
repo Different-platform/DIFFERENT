@@ -20,6 +20,7 @@ from services.api.rag import (
     explain,
     followup,
     generate,
+    guidance,
     judge,
     retrieval,
     router,
@@ -78,18 +79,24 @@ def pipeline(monkeypatch):
         "sql_gen_hits": None,
         "history": [],
         "prior": None,
-        "asks_explain": False,
+        "followup_kind": "new",
         "classifier_calls": 0,
+        "guidance_kwargs": None,
     }
 
-    async def fake_asks_for_explanation(question, prior_q, prior_a, *, gateway):
+    async def fake_classify_followup(question, prior_q, prior_a, *, gateway):
         del question, prior_q, prior_a, gateway
         state["classifier_calls"] += 1
-        return state["asks_explain"]
+        return state["followup_kind"]
 
     async def fake_explain_compose(**kwargs):
         order.append("explain")
         return "It is 703 times weight over height squared."
+
+    async def fake_guidance_compose(**kwargs):
+        order.append("guidance")
+        state["guidance_kwargs"] = kwargs
+        return "Use it as a descriptive point estimate; it has no standard error."
 
     async def fake_run_db(operation, *args, **kwargs):
         if operation is relational_store.ensure_conversation:
@@ -161,10 +168,9 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(judge, "classify_presence", fake_judge)
     monkeypatch.setattr(generate, "compose", fake_compose)
     monkeypatch.setattr(sql_gen, "generate", fake_sql_gen)
-    monkeypatch.setattr(
-        followup, "asks_for_explanation", fake_asks_for_explanation
-    )
+    monkeypatch.setattr(followup, "classify", fake_classify_followup)
     monkeypatch.setattr(explain, "compose", fake_explain_compose)
+    monkeypatch.setattr(guidance, "compose", fake_guidance_compose)
 
     return {"order": order, "state": state, "db_ops": db_ops}
 
@@ -551,7 +557,7 @@ def computed_turn(state, with_sql=True):
 async def test_explain_request_is_answered_from_the_saved_computation(pipeline):
     state = pipeline["state"]
     computed_turn(state)
-    state["asks_explain"] = True
+    state["followup_kind"] = "explain"
 
     events = await run(pipeline, "Explain me in detail")
     kinds = types_of(events)
@@ -575,18 +581,47 @@ async def test_explain_request_is_answered_from_the_saved_computation(pipeline):
 async def test_a_non_explain_follow_up_takes_the_normal_pipeline(pipeline):
     state = pipeline["state"]
     computed_turn(state)
-    state["asks_explain"] = False
+    state["followup_kind"] = "new"
 
     await run(pipeline, "What about 2021?")
     assert state["classifier_calls"] == 1
-    assert "retrieve" in pipeline["order"] and "explain" not in pipeline["order"]
+    order = pipeline["order"]
+    assert "retrieve" in order
+    assert "explain" not in order and "guidance" not in order
+
+
+async def test_research_guidance_is_answered_without_recomputing(pipeline):
+    """'How can I use this BMI in my research?' re-ran the query and repeated
+    the same number. It must give advice about the saved figure instead."""
+    state = pipeline["state"]
+    computed_turn(state)
+    state["followup_kind"] = "guidance"
+
+    events = await run(pipeline, "How can I use this BMI in my research?")
+    kinds = types_of(events)
+    order = pipeline["order"]
+
+    assert "guidance" in order
+    assert "rewrite" not in order and "retrieve" not in order
+    assert "judge" not in order and "sql_gen" not in order and "execute" not in order
+    # No new number and no repeat of the SQL panel the last answer showed.
+    assert "result" not in kinds and "sql" not in kinds
+    assert "standard error" in answer_of(events)
+    assert kinds[0] == "route" and kinds[-1] == "done"
+    # The advice is about the saved computation.
+    assert state["guidance_kwargs"]["sql"] == PRIOR_SQL
+    assert state["guidance_kwargs"]["message"] == "How can I use this BMI in my research?"
+    # Logged once, as guidance, against the SQL it is about.
+    assert len(state["logged"]) == 1
+    logged = state["logged"][0]
+    assert logged["intent"] == "guidance" and logged["generated_sql"] == PRIOR_SQL
 
 
 async def test_classifier_is_not_called_when_the_last_answer_has_no_computation(pipeline):
     """Nothing to explain after a codebook answer; don't spend a call asking."""
     state = pipeline["state"]
     computed_turn(state, with_sql=False)
-    state["asks_explain"] = True
+    state["followup_kind"] = "explain"
 
     await run(pipeline, "Explain me in detail")
     assert state["classifier_calls"] == 0

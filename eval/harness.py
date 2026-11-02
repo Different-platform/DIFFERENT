@@ -201,6 +201,11 @@ def _score(
         if expect_verified and spec.get("expect_result", True) and not had_result:
             reasons.append("expected a verified result but no number was produced")
 
+    # A turn about the previous answer (explain, research guidance) must not
+    # re-run the query: "how can I use this?" once repeated the same number.
+    if spec.get("expect_result") is False and had_result:
+        reasons.append("produced a new result but should only talk about the last one")
+
     # Wording checks, for behaviour a verdict cannot show: an explanation must
     # describe the calculation, and must not contradict the answer it explains.
     lowered = answer.lower()

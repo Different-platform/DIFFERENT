@@ -34,6 +34,7 @@ from services.api.rag import (
     explain,
     followup,
     generate,
+    guidance,
     judge,
     present,
     retrieval,
@@ -112,11 +113,13 @@ class Orchestrator:
                 content=question,
             )
 
-            # --- "explain that": answer from the computation that ran ---
+            # --- "explain that" / "how do I use this": answer from the
+            # computation that ran ---
             # A request about the previous answer must not go back through
             # retrieval and the judge, which never saw that computation and
-            # can contradict it. Only considered when the last turn was a
-            # computed, verified statistic.
+            # can contradict it, nor re-run the query and repeat the number.
+            # Only considered when the last turn was a computed, verified
+            # statistic.
             prior = (
                 await db.run_db(relational_store.load_last_assistant, conversation_uuid)
                 if history
@@ -126,10 +129,22 @@ class Orchestrator:
                 prior_question = next(
                     (m.content for m in reversed(history) if m.role == "user"), ""
                 )
-                if await followup.asks_for_explanation(
+                kind = await followup.classify(
                     question, prior_question, prior["content"], gateway=self.gateway
-                ):
+                )
+                if kind == "explain":
                     async for event in self._explain_previous(
+                        question,
+                        prior,
+                        prior_question,
+                        conversation_uuid,
+                        started,
+                        sql_state,
+                    ):
+                        yield event
+                    return
+                if kind == "guidance":
+                    async for event in self._guide_previous(
                         question,
                         prior,
                         prior_question,
@@ -319,11 +334,7 @@ class Orchestrator:
         """
         sql = prior["generated_sql"]
         verdict = prior.get("verdict") or "MEASURED"
-        fields = Citation.__dataclass_fields__
-        citations = [
-            Citation(**{k: v for k, v in c.items() if k in fields})
-            for c in (prior.get("citations") or [])
-        ]
+        citations = _citations_of(prior)
 
         yield events.route("data")
         yield events.verdict(verdict)
@@ -331,14 +342,7 @@ class Orchestrator:
             yield events.citations(citations)
         yield events.sql(sql, verified=True, problems=[])
 
-        year = explain.year_of(sql)
-        variables: list[Hit] = []
-        if year is not None:
-            for name in explain.variable_names(sql):
-                found = await db.run_db(vector_store.get_variable, year, name)
-                if found is not None:
-                    variables.append(found)
-
+        variables = await self._variables_used(sql)
         text = await explain.compose(
             question=prior_question,
             summary=prior["content"],
@@ -349,16 +353,8 @@ class Orchestrator:
         for chunk in _chunk(text):
             yield events.token(chunk)
 
-        # The SQL is carried forward so a second "explain more" still works.
-        message_id = await db.run_db(
-            relational_store.insert_message,
-            conversation_uuid,
-            role="assistant",
-            content=text,
-            citations=citations or None,
-            verdict=verdict,
-            generated_sql=sql,
-            sql_verified=True,
+        message_id = await self._save_followup(
+            text, prior, citations, verdict, conversation_uuid
         )
         sql_state.update(sql=sql, verified=True, notes=None)
         await self._log(
@@ -373,6 +369,96 @@ class Orchestrator:
             sql_state=sql_state,
         )
         yield events.done(message_id)
+
+    async def _guide_previous(
+        self,
+        question: str,
+        prior: dict,
+        prior_question: str,
+        conversation_uuid,
+        started: float,
+        sql_state: dict,
+    ) -> AsyncIterator[dict]:
+        """Advise on using the last computed statistic in research.
+
+        No retrieval, no judge, no new SQL, and no repeat of the SQL panel or
+        result table that the previous answer already shows: the reply is
+        advice, grounded in research notes built from the saved SQL and
+        checked for numbers that were not in its material (rag/guidance.py).
+        """
+        sql = prior["generated_sql"]
+        verdict = prior.get("verdict") or "MEASURED"
+        citations = _citations_of(prior)
+
+        yield events.route("codebook")
+        yield events.verdict(verdict)
+        if citations:
+            yield events.citations(citations)
+
+        variables = await self._variables_used(sql)
+        text = await guidance.compose(
+            message=question,
+            prior_question=prior_question,
+            summary=prior["content"],
+            sql=sql,
+            variables=variables,
+            gateway=self.gateway,
+        )
+        for chunk in _chunk(text):
+            yield events.token(chunk)
+
+        message_id = await self._save_followup(
+            text, prior, citations, verdict, conversation_uuid
+        )
+        # Logged with the SQL the advice is about, but nothing new ran.
+        sql_state.update(sql=sql, verified=True, notes=None)
+        await self._log(
+            question=question,
+            standalone=question,
+            conversation_uuid=conversation_uuid,
+            message_id=message_id,
+            intent="guidance",
+            verdict=verdict,
+            hits=[],
+            started=started,
+            sql_state=sql_state,
+        )
+        yield events.done(message_id)
+
+    async def _variables_used(self, sql: str) -> list[Hit]:
+        """Codebook details for the variables a saved query used."""
+        year = explain.year_of(sql)
+        variables: list[Hit] = []
+        if year is not None:
+            for name in explain.variable_names(sql):
+                found = await db.run_db(vector_store.get_variable, year, name)
+                if found is not None:
+                    variables.append(found)
+        return variables
+
+    async def _save_followup(
+        self,
+        text: str,
+        prior: dict,
+        citations: list[Citation],
+        verdict: Verdict,
+        conversation_uuid,
+    ) -> int:
+        """Save a reply about the previous answer.
+
+        The SQL is carried forward so a further "explain more" or "how do I
+        use this" still has the computation to talk about.
+        """
+        return await db.run_db(
+            relational_store.insert_message,
+            conversation_uuid,
+            role="assistant",
+            content=text,
+            citations=citations or None,
+            verdict=verdict,
+            generated_sql=prior["generated_sql"],
+            sql_verified=True,
+        )
 
     async def _with_derivation_inputs(
         self, question: str, hits: list[Hit], survey_year: int
@@ -598,6 +684,15 @@ def _retrieved_summary(hits: list[Hit]) -> list[dict]:
             "page": hit.page,
         }
         for hit in hits
+    ]
+
+
+def _citations_of(prior: dict) -> list[Citation]:
+    """Rebuild the citations saved with a previous assistant message."""
+    fields = Citation.__dataclass_fields__
+    return [
+        Citation(**{k: v for k, v in c.items() if k in fields})
+        for c in (prior.get("citations") or [])
     ]
 
 

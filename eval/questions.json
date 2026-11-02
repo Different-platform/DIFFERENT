@@ -105,6 +105,16 @@
       "note": "Regression: this used to go back through retrieval and the judge, which answered that BMI could not be computed, contradicting the answer it was asked to explain. It must explain the saved calculation and produce no new number."
     },
     {
+      "id": "g1",
+      "conversation": "explain",
+      "question": "How can I use this BMI in my research?",
+      "expect_verdict": "MEASURED",
+      "expect_result": false,
+      "expect_text": ["standard error", "self-report"],
+      "reject_text": ["cannot be computed"],
+      "note": "Regression: this was rewritten into a data question, re-ran the BMI query and repeated the same number. It must give research guidance (point estimate without a standard error, self-reported height and weight) and produce no new number."
+    },
+    {
       "id": "a1",
       "question": "What percentage of adults own a firearm?",
       "expect_verdict": "ABSENT",

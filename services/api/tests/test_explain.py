@@ -78,28 +78,91 @@ async def test_explanation_that_keeps_inventing_falls_back_to_the_shown_summary(
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ('{"explain": true}', True),
-        ('{"explain": false}', False),
-        ('```json\n{"explain": true}\n```', True),
-        ("not json at all", False),
-        ('{"explain": "yes"}', False),  # only a real true counts
-        ("", False),
+        ('{"kind": "explain"}', "explain"),
+        ('{"kind": "guidance"}', "guidance"),
+        ('{"kind": "new"}', "new"),
+        ('{"kind": "Guidance "}', "guidance"),
+        ('```json\n{"kind": "explain"}\n```', "explain"),
+        ('{"explain": true}', "explain"),  # the older two-way shape
+        ('{"explain": false}', "new"),
+        ('{"kind": "maybe"}', "new"),
+        ("not json at all", "new"),
+        ("[1, 2]", "new"),
+        ("", "new"),
     ],
 )
 def test_parse(raw, expected):
-    assert followup._parse(raw) is expected
+    assert followup._parse(raw) == expected
+
+
+class _Broken:
+    async def complete(self, **kwargs):
+        from services.api.llm.gateway import LLMGatewayError
+
+        raise LLMGatewayError("down")
 
 
 async def test_classifier_failure_means_use_the_normal_pipeline():
-    from services.api.llm.gateway import LLMGatewayError
-
-    class Broken:
-        async def complete(self, **kwargs):
-            raise LLMGatewayError("down")
-
     assert (
-        await followup.asks_for_explanation(
-            "Explain me in detail", QUESTION, SUMMARY, gateway=Broken()
+        await followup.classify(
+            "Explain me in detail", QUESTION, SUMMARY, gateway=_Broken()
         )
-        is False
+        == "new"
     )
+
+
+async def test_classifier_failure_still_catches_a_plain_research_question():
+    assert (
+        await followup.classify(
+            "How can I use this BMI in my research?", QUESTION, SUMMARY,
+            gateway=_Broken(),
+        )
+        == "guidance"
+    )
+
+
+async def test_a_missed_research_question_is_caught_by_the_backstop():
+    """The exact message that used to re-run the query and repeat the number."""
+    gateway = FakeLLMGateway(responses=['{"kind": "new"}'])
+    kind = await followup.classify(
+        "How can I use this BMI in my research?", QUESTION, SUMMARY, gateway=gateway
+    )
+    assert kind == "guidance"
+
+
+async def test_the_classifier_choice_is_kept_when_it_is_not_new():
+    gateway = FakeLLMGateway(responses=['{"kind": "explain"}'])
+    kind = await followup.classify(
+        "How should I interpret this?", QUESTION, SUMMARY, gateway=gateway
+    )
+    assert kind == "explain"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "How can I use this BMI in my research?",
+        "how should I interpret this?",
+        "What are the limitations?",
+        "Is this OK for my thesis?",
+        "Any caveats I should know?",
+    ],
+)
+def test_backstop_recognises_research_guidance(message):
+    assert followup.looks_like_guidance(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "What about 2021?",
+        "Can you do it categorically?",
+        "Break it down by sex for my study",
+        "For my research I need it for women",
+        "Can I compare this with 2019 for my paper?",
+        "How is food insecurity measured?",
+        "Explain me in detail",
+    ],
+)
+def test_backstop_leaves_new_computations_alone(message):
+    assert not followup.looks_like_guidance(message)
