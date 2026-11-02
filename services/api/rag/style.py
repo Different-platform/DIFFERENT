@@ -28,3 +28,26 @@ your answer.
 - No headings, no bullet lists, no markdown. Separate paragraphs with a blank \
 line.\
 """
+
+#: Typographic characters the model emits that look like ordinary ones but
+#: break copy-paste into a paper and text search, and in some fonts render as
+#: no space at all ("18\u202fyears" reads as "18years").
+_LOOK_ALIKES = str.maketrans(
+    {
+        "\u00a0": " ",  # no-break space
+        "\u202f": " ",  # narrow no-break space
+        "\u2009": " ",  # thin space
+        "\u2007": " ",  # figure space
+        "\u2010": "-",  # hyphen
+        "\u2011": "-",  # non-breaking hyphen
+    }
+)
+
+
+def plain_chars(text: str) -> str:
+    """Replace look-alike spaces and hyphens with ordinary ones.
+
+    Safe on a streamed chunk: it maps one character to one character and
+    never trims, so chunk boundaries are unaffected.
+    """
+    return (text or "").translate(_LOOK_ALIKES)

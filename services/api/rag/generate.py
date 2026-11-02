@@ -65,7 +65,9 @@ Write two to four sentences. Do not restate the question.
 - Variable codes ARE allowed here, because the question is about what the \
 survey records: describe each variable in plain words first, then give its \
 code once in parentheses, for example "whether a doctor ever said they had \
-diabetes (DIBEV_A)".\
+diabetes (DIBEV_A)".
+- Do not quote missing-data codes or numeric response codes; say "people who \
+did not answer" instead. Call the survey "NHIS" or "the survey".\
 """
 
 

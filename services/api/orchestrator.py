@@ -42,6 +42,7 @@ from services.api.rag import (
     router,
     scope,
     sql_gen,
+    style,
     verify,
 )
 from services.api.store import db, readonly_store, relational_store, vector_store
@@ -242,6 +243,7 @@ class Orchestrator:
                 async for chunk in generate.compose(
                     standalone, hits[:1], verdict, gateway=self.gateway
                 ):
+                    chunk = style.plain_chars(chunk)
                     answer_parts.append(chunk)
                     yield events.token(chunk)
 
@@ -263,6 +265,7 @@ class Orchestrator:
                     async for chunk in generate.compose(
                         standalone, hits, verdict, gateway=self.gateway
                     ):
+                        chunk = style.plain_chars(chunk)
                         answer_parts.append(chunk)
                         yield events.token(chunk)
 

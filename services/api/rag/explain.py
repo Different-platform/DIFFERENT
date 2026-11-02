@@ -20,7 +20,7 @@ from decimal import Decimal, InvalidOperation
 
 from services.api.domain import Hit
 from services.api.llm.gateway import LLMGateway, Message
-from services.api.rag.style import PLAIN_LANGUAGE
+from services.api.rag.style import PLAIN_LANGUAGE, plain_chars
 
 SYSTEM_PROMPT = """\
 You explain how a number you already worked out from the U.S. National Health \
@@ -105,24 +105,13 @@ def ungrounded_numbers(text: str, source: str) -> list[str]:
     return bad
 
 
-#: Typographic characters the model emits that look like ordinary ones but
-#: break copy-paste into a paper, text search, and exact-match checks
-#: ("self‑reported" with U+2011 does not contain "self-report").
-_PLAIN = str.maketrans(
-    {
-        "\u00a0": " ",  # no-break space
-        "\u202f": " ",  # narrow no-break space
-        "\u2009": " ",  # thin space
-        "\u2007": " ",  # figure space
-        "\u2010": "-",  # hyphen
-        "\u2011": "-",  # non-breaking hyphen
-    }
-)
-
-
 def plain_text(text: str) -> str:
-    """Model prose with look-alike spaces and hyphens made ordinary."""
-    return (text or "").translate(_PLAIN).strip()
+    """Model prose with look-alike spaces and hyphens made ordinary.
+
+    "self‑reported" with U+2011 does not contain "self-report", and
+    "18\u202fyears" can render as "18years".
+    """
+    return plain_chars(text).strip()
 
 
 def _code(value) -> str:

@@ -202,3 +202,12 @@ async def test_look_alike_spaces_and_hyphens_are_made_plain():
     styled = "Use the R\u202fsurvey package; BMI is self\u2011reported."
     text, _ = await run_compose([styled])
     assert text == "Use the R survey package; BMI is self-reported."
+
+
+def test_plain_chars_keeps_chunk_length_and_boundaries():
+    """Applied to streamed tokens, so it must not trim or merge anything."""
+    from services.api.rag.style import plain_chars
+
+    chunk = " aged 18\u202fyears "
+    assert plain_chars(chunk) == " aged 18 years "
+    assert len(plain_chars(chunk)) == len(chunk)
