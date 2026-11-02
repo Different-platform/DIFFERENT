@@ -133,8 +133,7 @@ def test_the_note_for_papers_is_only_used_when_asked_about_research():
 
 
 async def test_a_why_question_gets_no_methods_note_in_its_prompt():
-    why = "What is the reason for the increase in BMI from 2022 to 2023?"
-    _, gateway = await run_compose(["BMI was slightly higher."], message=why, earlier=EARLIER)
+    _, gateway = await run_compose(["BMI was slightly higher."], message=WHY, earlier=EARLIER)
     assert "PSTRAT" not in gateway.calls[0]["messages"][0].content
 
 
@@ -148,17 +147,31 @@ def test_fallback_is_short_and_contains_no_ungrounded_number():
 
 
 # --- composing the reply -------------------------------------------------------
-async def test_a_grounded_reply_is_returned_as_is():
-    text, gateway = await run_compose([GOOD])
-    assert text == GOOD
+WHY = "What is the reason for the increase in BMI from 2022 to 2023?"
+
+
+async def test_a_research_reply_gets_the_exact_methods_note_appended():
+    """A live reply paraphrased "re-run it with PSTRAT and PPSU" into "the
+    estimate was produced with PSTRAT and PPSU", which is false. The methods
+    note is appended verbatim and kept out of the model's prompt."""
+    plain = "You can use 27.96 to describe the typical BMI of U.S. adults in 2022."
+    text, gateway = await run_compose([plain])
+    methods = guidance.research_notes(sql=BMI_SQL, variables=[HEIGHT, WEIGHT])[-1]
+    assert text == f"{plain}\n\n{methods}"
     assert len(gateway.calls) == 1
     call = gateway.calls[0]
     prompt = call["messages"][0].content
     assert MESSAGE in prompt and "Notes (true for these numbers)" in prompt
-    assert BMI_SQL in prompt
+    assert BMI_SQL in prompt and "PSTRAT" not in prompt
     assert call["stage"] == "guidance"
     # Plain-language rules travel with every guidance prompt.
     assert "no statistics, survey, or programming" in call["system"]
+
+
+async def test_a_why_reply_gets_no_methods_note():
+    plain = "The survey cannot say why. BMI was 27.96 in 2022."
+    text, _ = await run_compose([plain], message=WHY, earlier=EARLIER)
+    assert text == plain
 
 
 async def test_earlier_numbers_are_given_to_the_model_and_count_as_grounded():
@@ -199,9 +212,9 @@ async def test_an_empty_reply_falls_back_to_the_notes():
 
 async def test_look_alike_spaces_and_hyphens_are_made_plain():
     """gpt-oss writes U+202F and U+2011, which break copy-paste and search."""
-    styled = "Use the R\u202fsurvey package; BMI is self\u2011reported."
-    text, _ = await run_compose([styled])
-    assert text == "Use the R survey package; BMI is self-reported."
+    styled = "BMI rose a\u202flittle; it is self\u2011reported."
+    text, _ = await run_compose([styled], message=WHY)
+    assert text == "BMI rose a little; it is self-reported."
 
 
 def test_plain_chars_keeps_chunk_length_and_boundaries():
@@ -232,14 +245,14 @@ def test_style_problems_names_the_jargon_and_the_length():
 
 
 async def test_jargon_is_retried_with_the_terms_named():
-    text, gateway = await run_compose([JARGON_REPLY, PLAIN_REPLY])
+    text, gateway = await run_compose([JARGON_REPLY, PLAIN_REPLY], message=WHY)
     assert text == PLAIN_REPLY
     assert "descriptive statistic" in gateway.calls[1]["messages"][0].content
 
 
 async def test_a_grounded_reply_that_stays_wordy_is_still_used():
     """Wording is a second-chance check, not a reason to drop a correct answer."""
-    text, gateway = await run_compose([JARGON_REPLY, JARGON_REPLY])
+    text, gateway = await run_compose([JARGON_REPLY, JARGON_REPLY], message=WHY)
     assert text == JARGON_REPLY
     assert len(gateway.calls) == 2
 

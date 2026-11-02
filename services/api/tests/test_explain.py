@@ -16,7 +16,7 @@ SUMMARY = "The population-weighted mean for U.S. adults in 2023 is 28.03."
 QUESTION = "What is the weighted mean BMI for adults in 2023?"
 
 GOOD = (
-    "The figure 28.03 is a weighted mean BMI for 2023. BMI is 703 times weight "
+    "The figure 28.03 is the average BMI for 2023. BMI is 703 times weight "
     "in pounds divided by height in inches squared. Respondents coded 96, 97, 98 "
     "or 99 for height, or 996 to 999 for weight, were left out."
 )

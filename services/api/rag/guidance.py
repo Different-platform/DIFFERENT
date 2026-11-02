@@ -43,10 +43,10 @@ causes.
 - If they ask how to USE the number, for research or otherwise: say what it is \
 good for (describing U.S. adults, background for a study or article, comparing \
 with other published figures) and what it cannot do on its own (prove a cause, \
-or show that a difference is real). If a note starts "For a paper:", end with \
-one sentence starting "For a paper:" based on it; that sentence may name \
-PSTRAT and PPSU. If no note starts that way, do not mention citing, survey \
-software, or design variables at all.
+or show that a difference is real).
+- Do not give citation details, name survey software, or name design \
+variables: a fixed sentence for researchers is added after your answer when \
+it is relevant.
 - Otherwise, answer the message directly from the material.
 - Use only the notes that matter for this message, usually two or three.
 
@@ -179,6 +179,18 @@ def notes_for(message: str, notes: list[str]) -> list[str]:
     return notes[:-1]
 
 
+def _split_methods(notes: list[str]) -> tuple[list[str], str | None]:
+    """Separate the methods note, which is appended verbatim, not paraphrased.
+
+    A live reply turned "re-run it with PSTRAT and PPSU to get a margin of
+    error" into "the estimate was produced with PSTRAT and PPSU", which is
+    false. Technical instructions are exact or absent.
+    """
+    if notes and notes[-1].startswith("For a paper:"):
+        return notes[:-1], notes[-1]
+    return notes, None
+
+
 def fallback(notes: list[str]) -> str:
     """Used when no grounded reply can be produced.
 
@@ -240,7 +252,11 @@ async def compose(
     """A grounded reply, or the most useful notes if none can be made."""
     earlier = list(earlier or [])
     all_notes = research_notes(sql=sql, variables=variables)
-    notes = notes_for(message, all_notes)
+    notes, methods = _split_methods(notes_for(message, all_notes))
+
+    def finish(text: str) -> str:
+        return f"{text}\n\n{methods}" if methods else text
+
     source = "\n".join(
         [
             message,
@@ -282,7 +298,7 @@ async def compose(
         # retry; a grounded but wordy reply still beats the fallback.
         if text and not bad:
             if not wording or attempt == 1:
-                return text
+                return finish(text)
             candidate = text
         problems: list[str] = []
         if bad:
@@ -294,4 +310,6 @@ async def compose(
             )
         problems.extend(wording)
         feedback = " ".join(problems) or None
-    return candidate or fallback(notes)
+    if candidate:
+        return finish(candidate)
+    return fallback(notes + ([methods] if methods else []))
