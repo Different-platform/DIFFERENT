@@ -23,7 +23,7 @@ import re
 from services.api.domain import Hit
 from services.api.llm.gateway import LLMGateway, Message
 from services.api.rag import derivations, explain
-from services.api.rag.style import PLAIN_LANGUAGE
+from services.api.rag.style import PLAIN_LANGUAGE, style_problems
 
 SYSTEM_PROMPT = """\
 You answer a follow-up question about numbers you already worked out from the \
@@ -253,7 +253,8 @@ async def compose(
         ]
     )
     feedback: str | None = None
-    for _ in range(2):
+    candidate: str | None = None
+    for attempt in range(2):
         response = await gateway.complete(
             system=SYSTEM_PROMPT,
             messages=[
@@ -276,13 +277,21 @@ async def compose(
         )
         text = explain.plain_text(response.text)
         bad = explain.ungrounded_numbers(text, source)
+        wording = style_problems(text)
+        # Ungrounded numbers are never accepted. Wording problems get one
+        # retry; a grounded but wordy reply still beats the fallback.
         if text and not bad:
-            return text
+            if not wording or attempt == 1:
+                return text
+            candidate = text
+        problems: list[str] = []
         if bad:
-            feedback = (
+            problems.append(
                 "Your previous reply contained numbers that are not in the "
                 f"material above ({', '.join(bad)}). Rewrite it using only "
                 "numbers that appear in the material, and describe any "
                 "difference in words instead of calculating it."
             )
-    return fallback(notes)
+        problems.extend(wording)
+        feedback = " ".join(problems) or None
+    return candidate or fallback(notes)

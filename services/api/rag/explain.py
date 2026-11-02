@@ -20,7 +20,7 @@ from decimal import Decimal, InvalidOperation
 
 from services.api.domain import Hit
 from services.api.llm.gateway import LLMGateway, Message
-from services.api.rag.style import PLAIN_LANGUAGE, plain_chars
+from services.api.rag.style import PLAIN_LANGUAGE, plain_chars, style_problems
 
 SYSTEM_PROMPT = """\
 You explain how a number you already worked out from the U.S. National Health \
@@ -172,7 +172,8 @@ async def compose(
         [question, summary, sql, *[describe_variable(v) for v in variables]]
     )
     feedback: str | None = None
-    for _ in range(2):
+    candidate: str | None = None
+    for attempt in range(2):
         response = await gateway.complete(
             system=SYSTEM_PROMPT,
             messages=[
@@ -186,12 +187,20 @@ async def compose(
         )
         text = plain_text(response.text)
         bad = ungrounded_numbers(text, source)
+        wording = style_problems(text)
+        # Ungrounded numbers are never accepted. Wording problems get one
+        # retry; a grounded but wordy reply still beats the fallback.
         if text and not bad:
-            return text
+            if not wording or attempt == 1:
+                return text
+            candidate = text
+        notes: list[str] = []
         if bad:
-            feedback = (
+            notes.append(
                 "Your previous explanation contained numbers that are not in "
                 f"the material above ({', '.join(bad)}). Rewrite it using only "
                 "numbers that appear in the material."
             )
-    return fallback(summary)
+        notes.extend(wording)
+        feedback = " ".join(notes) or None
+    return candidate or fallback(summary)

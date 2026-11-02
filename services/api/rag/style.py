@@ -12,6 +12,8 @@ One shared instruction block so every model-written answer reads the same way.
 
 from __future__ import annotations
 
+import re
+
 PLAIN_LANGUAGE = """\
 How to write (the reader may have no statistics, survey, or programming \
 background):
@@ -51,3 +53,35 @@ def plain_chars(text: str) -> str:
     never trims, so chunk boundaries are unaffected.
     """
     return (text or "").translate(_LOOK_ALIKES)
+
+
+#: Terms the plain-language rules forbid. The prompt alone does not stop the
+#: model using them (a live reply said "non-institutionalized" and
+#: "descriptive statistic"), so a reply is checked and retried once.
+_JARGON = re.compile(
+    r"\b(?:point estimates?|cross[- ]sectional|population[- ]weighted|"
+    r"weighted (?:mean|average)|non[- ]?institutionali[sz]ed|descriptive statistics?|"
+    r"sampling variation|sentinel|inference|inferential|statistically significant)\b",
+    re.IGNORECASE,
+)
+
+#: Above this a reply gets one retry asking for a shorter answer.
+MAX_WORDS = 150
+
+
+def style_problems(text: str) -> list[str]:
+    """Why `text` breaks the plain-language rules (empty when it does not)."""
+    problems: list[str] = []
+    terms = sorted({m.group(0).lower() for m in _JARGON.finditer(text or "")})
+    if terms:
+        problems.append(
+            "It used technical terms a non-specialist will not know ("
+            + ", ".join(terms)
+            + "). Say what they mean in everyday words instead."
+        )
+    words = len((text or "").split())
+    if words > MAX_WORDS:
+        problems.append(
+            f"It was {words} words long. Keep it under {MAX_WORDS - 30} words."
+        )
+    return problems

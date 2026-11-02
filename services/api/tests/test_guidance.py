@@ -211,3 +211,40 @@ def test_plain_chars_keeps_chunk_length_and_boundaries():
     chunk = " aged 18\u202fyears "
     assert plain_chars(chunk) == " aged 18 years "
     assert len(plain_chars(chunk)) == len(chunk)
+
+
+# --- plain-language check ----------------------------------------------------
+JARGON_REPLY = (
+    "This is a descriptive statistic for the civilian non-institutionalized "
+    "population in 2022 (27.96)."
+)
+PLAIN_REPLY = "The average BMI was 27.96 in 2022. Use it to describe U.S. adults."
+
+
+def test_style_problems_names_the_jargon_and_the_length():
+    from services.api.rag.style import style_problems
+
+    problems = style_problems(JARGON_REPLY + " word" * 150)
+    assert "descriptive statistic" in problems[0]
+    assert "non-institutionalized" in problems[0]
+    assert "words long" in problems[1]
+    assert style_problems(PLAIN_REPLY) == []
+
+
+async def test_jargon_is_retried_with_the_terms_named():
+    text, gateway = await run_compose([JARGON_REPLY, PLAIN_REPLY])
+    assert text == PLAIN_REPLY
+    assert "descriptive statistic" in gateway.calls[1]["messages"][0].content
+
+
+async def test_a_grounded_reply_that_stays_wordy_is_still_used():
+    """Wording is a second-chance check, not a reason to drop a correct answer."""
+    text, gateway = await run_compose([JARGON_REPLY, JARGON_REPLY])
+    assert text == JARGON_REPLY
+    assert len(gateway.calls) == 2
+
+
+async def test_an_invented_number_is_never_kept_even_if_plain():
+    invented = "About 26,969 people answered."
+    text, _ = await run_compose([invented, invented])
+    assert "26,969" not in text
