@@ -135,3 +135,18 @@ async def test_a_reply_that_keeps_inventing_falls_back_to_the_notes():
 async def test_an_empty_reply_falls_back_to_the_notes():
     text, _ = await run_compose(["", ""])
     assert text.startswith("Here is how to use this figure in research.")
+
+
+def test_notes_do_not_call_2019_to_2023_incomparable():
+    """The first live reply said 2022 was not comparable with 'earlier years';
+    2019-2023 share one questionnaire, only pre-2019 is cut off."""
+    notes = joined(guidance.research_notes(sql=BMI_SQL, variables=[]))
+    assert "2019 to 2023 all use the questionnaire" in notes
+    assert "2018 or earlier are not directly comparable" in notes
+
+
+async def test_look_alike_spaces_and_hyphens_are_made_plain():
+    """gpt-oss writes U+202F and U+2011, which break copy-paste and search."""
+    styled = "Use the R\u202fsurvey package; BMI is self\u2011reported."
+    text, _ = await run_compose([styled])
+    assert text == "Use the R survey package; BMI is self-reported."

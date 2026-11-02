@@ -103,6 +103,26 @@ def ungrounded_numbers(text: str, source: str) -> list[str]:
     return bad
 
 
+#: Typographic characters the model emits that look like ordinary ones but
+#: break copy-paste into a paper, text search, and exact-match checks
+#: ("self‑reported" with U+2011 does not contain "self-report").
+_PLAIN = str.maketrans(
+    {
+        "\u00a0": " ",  # no-break space
+        "\u202f": " ",  # narrow no-break space
+        "\u2009": " ",  # thin space
+        "\u2007": " ",  # figure space
+        "\u2010": "-",  # hyphen
+        "\u2011": "-",  # non-breaking hyphen
+    }
+)
+
+
+def plain_text(text: str) -> str:
+    """Model prose with look-alike spaces and hyphens made ordinary."""
+    return (text or "").translate(_PLAIN).strip()
+
+
 def _code(value) -> str:
     return str(int(value)) if value == value.to_integral_value() else str(value)
 
@@ -173,7 +193,7 @@ async def compose(
             temperature=0.2,
             stage="explain",
         )
-        text = response.text.strip()
+        text = plain_text(response.text)
         bad = ungrounded_numbers(text, source)
         if text and not bad:
             return text

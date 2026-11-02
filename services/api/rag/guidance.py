@@ -43,6 +43,7 @@ Rules:
 not in it: no sample sizes, cut-offs, other statistics, or page numbers.
 - Do not recompute the result or restate it with different precision.
 - The statistic WAS computed. Never say it cannot be computed.
+- State each caution exactly as strongly as the notes do; do not widen it.
 - No headings, no bullet lists, no markdown. Separate paragraphs with a blank \
 line.\
 """
@@ -139,12 +140,13 @@ def research_notes(*, sql: str, variables: list[Hit]) -> list[str]:
     )
 
     notes.append(
-        "If you compare years, check each variable's definition and response "
-        "options in each year's codebook. The NHIS questionnaire was "
-        "redesigned in 2019, so estimates from 2019 onward are not directly "
-        "comparable with earlier years, and in 2020 interviews moved largely "
-        "to telephone during the COVID-19 pandemic, so NCHS advises caution "
-        "when comparing 2020 estimates with other years."
+        "Survey years 2019 to 2023 all use the questionnaire NHIS introduced "
+        "in its 2019 redesign, so they can generally be compared once you "
+        "have checked that each variable's wording and response options are "
+        "the same in each year's codebook. Estimates from 2018 or earlier are "
+        "not directly comparable because of that redesign. In 2020 interviews "
+        "moved largely to telephone during the COVID-19 pandemic, so NCHS "
+        "advises caution when comparing 2020 estimates with other years."
     )
     return notes
 
@@ -222,7 +224,7 @@ async def compose(
             temperature=0.2,
             stage="guidance",
         )
-        text = response.text.strip()
+        text = explain.plain_text(response.text)
         bad = explain.ungrounded_numbers(text, source)
         if text and not bad:
             return text
