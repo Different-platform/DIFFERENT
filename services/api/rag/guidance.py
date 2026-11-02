@@ -23,7 +23,7 @@ import re
 from services.api.domain import Hit
 from services.api.llm.gateway import LLMGateway, Message
 from services.api.rag import derivations, explain
-from services.api.rag.style import PLAIN_LANGUAGE, style_problems
+from services.api.rag.style import PLAIN_LANGUAGE, simplify, style_problems
 
 SYSTEM_PROMPT = """\
 You answer a follow-up question about numbers you already worked out from the \
@@ -255,6 +255,7 @@ async def compose(
     notes, methods = _split_methods(notes_for(message, all_notes))
 
     def finish(text: str) -> str:
+        text = simplify(text)
         return f"{text}\n\n{methods}" if methods else text
 
     source = "\n".join(

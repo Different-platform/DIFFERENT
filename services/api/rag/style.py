@@ -85,3 +85,22 @@ def style_problems(text: str) -> list[str]:
             f"It was {words} words long. Keep it under {MAX_WORDS - 30} words."
         )
     return problems
+
+
+#: Last-resort plain wording for terms the model keeps using after a retry.
+#: Each swap keeps the meaning and is safe anywhere in a sentence.
+_SWAPS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\b(?:civilian,?\s+)?non-?institutionali[sz]ed\s+", re.IGNORECASE), ""),
+    (re.compile(r"\bweighted (mean|average)\b", re.IGNORECASE), "average"),
+    (re.compile(r"\bpopulation[- ]weighted\s+", re.IGNORECASE), ""),
+    (re.compile(r"\bsampling variation\b", re.IGNORECASE), "random variation"),
+    (re.compile(r"\bdescriptive statistic\b", re.IGNORECASE), "summary number"),
+    (re.compile(r"\bpoint estimate\b", re.IGNORECASE), "estimate"),
+)
+
+
+def simplify(text: str) -> str:
+    """Swap a few stubborn technical terms for everyday ones."""
+    for pattern, replacement in _SWAPS:
+        text = pattern.sub(replacement, text)
+    return text

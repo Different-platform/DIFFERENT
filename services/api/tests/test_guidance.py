@@ -250,11 +250,25 @@ async def test_jargon_is_retried_with_the_terms_named():
     assert "descriptive statistic" in gateway.calls[1]["messages"][0].content
 
 
-async def test_a_grounded_reply_that_stays_wordy_is_still_used():
-    """Wording is a second-chance check, not a reason to drop a correct answer."""
+async def test_a_grounded_reply_that_stays_wordy_is_still_used_with_terms_swapped():
+    """Wording is a second-chance check, not a reason to drop a correct answer;
+    the stubborn terms are swapped for everyday ones."""
     text, gateway = await run_compose([JARGON_REPLY, JARGON_REPLY], message=WHY)
-    assert text == JARGON_REPLY
     assert len(gateway.calls) == 2
+    assert text == "This is a summary number for the population in 2022 (27.96)."
+
+
+def test_simplify_swaps_the_terms_seen_in_live_replies():
+    from services.api.rag.style import simplify
+
+    live = (
+        "the weighted average BMI was 27.96; the figure represents the whole "
+        "non-institutionalized adult population; natural sampling variation"
+    )
+    assert simplify(live) == (
+        "the average BMI was 27.96; the figure represents the whole adult "
+        "population; natural random variation"
+    )
 
 
 async def test_an_invented_number_is_never_kept_even_if_plain():

@@ -20,7 +20,12 @@ from decimal import Decimal, InvalidOperation
 
 from services.api.domain import Hit
 from services.api.llm.gateway import LLMGateway, Message
-from services.api.rag.style import PLAIN_LANGUAGE, plain_chars, style_problems
+from services.api.rag.style import (
+    PLAIN_LANGUAGE,
+    plain_chars,
+    simplify,
+    style_problems,
+)
 
 SYSTEM_PROMPT = """\
 You explain how a number you already worked out from the U.S. National Health \
@@ -192,7 +197,7 @@ async def compose(
         # retry; a grounded but wordy reply still beats the fallback.
         if text and not bad:
             if not wording or attempt == 1:
-                return text
+                return simplify(text)
             candidate = text
         notes: list[str] = []
         if bad:
@@ -203,4 +208,4 @@ async def compose(
             )
         notes.extend(wording)
         feedback = " ".join(notes) or None
-    return candidate or fallback(summary)
+    return simplify(candidate) if candidate else fallback(summary)
