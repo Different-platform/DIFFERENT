@@ -43,9 +43,10 @@ causes.
 - If they ask how to USE the number, for research or otherwise: say what it is \
 good for (describing U.S. adults, background for a study or article, comparing \
 with other published figures) and what it cannot do on its own (prove a cause, \
-or show that a difference is real). Then add one last sentence starting "For \
-a paper:" that names the survey file to cite and says a margin of error needs \
-survey software; that sentence may name PSTRAT and PPSU.
+or show that a difference is real). If a note starts "For a paper:", end with \
+one sentence starting "For a paper:" based on it; that sentence may name \
+PSTRAT and PPSU. If no note starts that way, do not mention citing, survey \
+software, or design variables at all.
 - Otherwise, answer the message directly from the material.
 - Use only the notes that matter for this message, usually two or three.
 
@@ -160,6 +161,24 @@ def research_notes(*, sql: str, variables: list[Hit]) -> list[str]:
     return notes
 
 
+#: Wording that asks how to use, report, or cite a number. Only then is the
+#: technical note (survey file, PSTRAT, PPSU) relevant; a "why did it go up?"
+#: answer that ends with design-variable names is the jargon this replaces.
+_USE_CUE = re.compile(
+    r"\b(?:use|using|research|study|studies|paper|thesis|dissertation|cite|"
+    r"citation|report|publish\w*|article|analys[ie]s|methods?|journal|"
+    r"manuscript|limitations?)\b",
+    re.IGNORECASE,
+)
+
+
+def notes_for(message: str, notes: list[str]) -> list[str]:
+    """The notes relevant to `message`: the methods note only when asked."""
+    if _USE_CUE.search(message or ""):
+        return notes
+    return notes[:-1]
+
+
 def fallback(notes: list[str]) -> str:
     """Used when no grounded reply can be produced.
 
@@ -167,7 +186,8 @@ def fallback(notes: list[str]) -> str:
     than all of them: a wall of caveats is the unreadable answer this module
     exists to replace.
     """
-    chosen = notes[:3] + ([notes[-1]] if len(notes) > 3 else [])
+    last = notes[-1] if len(notes) > 3 and notes[-1].startswith("For a paper:") else None
+    chosen = notes[:3] + ([last] if last else [])
     return "Here is what this number can and cannot tell you.\n\n" + "\n\n".join(chosen)
 
 
@@ -219,7 +239,8 @@ async def compose(
 ) -> str:
     """A grounded reply, or the most useful notes if none can be made."""
     earlier = list(earlier or [])
-    notes = research_notes(sql=sql, variables=variables)
+    all_notes = research_notes(sql=sql, variables=variables)
+    notes = notes_for(message, all_notes)
     source = "\n".join(
         [
             message,

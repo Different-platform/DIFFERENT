@@ -123,6 +123,21 @@ def test_notes_do_not_call_2019_to_2023_incomparable():
     assert "before 2019 used an older questionnaire" in notes
 
 
+def test_the_note_for_papers_is_only_used_when_asked_about_research():
+    """'Why did it go up?' ended with PSTRAT and PPSU, which nobody asked for."""
+    notes = guidance.research_notes(sql=BMI_SQL, variables=[])
+    why = guidance.notes_for("What is the reason for the increase in BMI?", notes)
+    assert not any("PSTRAT" in note for note in why)
+    use = guidance.notes_for("How can I use this BMI in my research?", notes)
+    assert use[-1].startswith("For a paper:")
+
+
+async def test_a_why_question_gets_no_methods_note_in_its_prompt():
+    why = "What is the reason for the increase in BMI from 2022 to 2023?"
+    _, gateway = await run_compose(["BMI was slightly higher."], message=why, earlier=EARLIER)
+    assert "PSTRAT" not in gateway.calls[0]["messages"][0].content
+
+
 def test_fallback_is_short_and_contains_no_ungrounded_number():
     notes = guidance.research_notes(sql=BMI_SQL, variables=[HEIGHT, WEIGHT])
     text = guidance.fallback(notes)

@@ -82,7 +82,7 @@ def test_distribution_codes_become_labels_and_fractions_become_percentages():
     # The reader gets the finding, the exclusions, and the weighting, in words.
     assert "Underweight 1.6%" in presented.summary
     assert "largest group is Overweight" in presented.summary
-    assert "People with no usable answer (unknown) were left out." in presented.summary
+    assert "did not give a usable answer" in presented.summary
     assert "represent all U.S. adults" in presented.summary
     assert_plain(presented.summary)
 
@@ -107,9 +107,22 @@ def test_derived_scalar_is_described_as_derived():
     assert "compares a person's weight with their height" in presented.summary
     assert "height and weight people reported" in presented.summary
     # And what the number means on the standard scale.
-    assert "falls in the overweight range" in presented.summary
-    assert "refused" in presented.summary  # what was excluded is stated
+    assert "this average is in the overweight range" in presented.summary
+    assert "did not give a usable answer" in presented.summary
     assert_plain(presented.summary)
+    # Short enough to read at a glance (the old summary ran to 80+ words of
+    # codes and caveats before the reader learned what the number meant).
+    assert len(presented.summary.split()) <= 110
+
+
+def test_no_exclusion_sentence_when_nothing_was_excluded():
+    plain = make_hit("AGEP_A", "Age of SA (top coded)", [])
+    presented = present_result(
+        ["weighted_mean"], [[48.1]],
+        sql="SELECT SUM(AGEP_A * WTFA_A) / SUM(WTFA_A) AS weighted_mean FROM survey_2023",
+        hits=[plain], year=2023,
+    )
+    assert "usable answer" not in presented.summary
 
 
 @pytest.mark.parametrize(

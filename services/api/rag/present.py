@@ -31,7 +31,6 @@ _PLUMBING = frozenset({"wtfa_a", "wtia_a", "wtfa_sa", "wtia_sa", "pstrat", "ppsu
 #: conditional subsample is easy to misread as covering all adults.
 _GENERIC_UNIVERSE = "sample adults 18+"
 
-_MAX_EXCLUSION_LABELS = 6
 
 
 @dataclass(frozen=True)
@@ -234,10 +233,7 @@ def _bmi_band(value: Any) -> str | None:
     return "obese"
 
 
-def _or_list(items: list[str]) -> str:
-    if len(items) <= 1:
-        return "".join(items)
-    return ", ".join(items[:-1]) + " or " + items[-1]
+
 
 
 # ---------------------------------------------------------------------------
@@ -470,16 +466,15 @@ def _summarize(
             sentences.append(f"The average BMI for {scope} was {value}.")
             sentences.append(
                 "BMI (body mass index) compares a person's weight with their "
-                "height. NHIS does not publish it as a single number, so it was "
-                "worked out from the height and weight people reported."
+                "height. It was worked out from the height and weight people "
+                "reported."
             )
             band = _bmi_band(value)
             if band:
                 sentences.append(
-                    "On the standard adult BMI scale used by the CDC, under 18.5 "
-                    "is underweight, 18.5 to 24.9 is a healthy weight, 25 to "
-                    f"29.9 is overweight and 30 or more is obese, so this average "
-                    f"falls in the {band} range."
+                    "On the CDC's adult scale (under 18.5 underweight, 18.5 to "
+                    "24.9 healthy weight, 25 to 29.9 overweight, 30 or more "
+                    f"obese), this average is in the {band} range."
                 )
         elif metric_kind == "mean" and derived:
             sentences.append(
@@ -507,17 +502,12 @@ def _summarize(
             f"table below."
         )
 
-    excluded: list[str] = []
-    for hit in used:
-        for vl in hit.sentinel_labels:
-            text = vl.label.strip().lower()
-            if text and text not in excluded:
-                excluded.append(text)
-    if excluded:
+    # The exact missing-data codes are in the SQL panel; the reader only
+    # needs to know that people without an answer were not counted.
+    if any(hit.sentinel_labels for hit in used):
         sentences.append(
-            "People with no usable answer ("
-            + _or_list(excluded[:_MAX_EXCLUSION_LABELS])
-            + ") were left out."
+            "People who did not give a usable answer (for example, they refused "
+            "or did not know) were left out."
         )
 
     focus = group_vars[0] if group_vars else (measure_vars[0] if measure_vars else None)
@@ -526,7 +516,7 @@ def _summarize(
         sentences.append(f"Only some adults were asked this question: {universe}.")
 
     sentences.append(
-        "The numbers are adjusted with the survey's weights so they represent "
-        "all U.S. adults, not just the people who took the survey."
+        "The survey's weights make the numbers represent all U.S. adults, not "
+        "just the people interviewed."
     )
     return " ".join(sentences)
