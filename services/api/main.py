@@ -25,6 +25,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from services.api.api.routes import chat, health, variables, years
 from services.api.config import settings
 from services.api.middleware.rate_limit import RateLimiter, RateLimitMiddleware
+from services.api.middleware.shared_secret import SharedSecretMiddleware
 from services.api.middleware.timing import TimingMiddleware
 from services.api.orchestrator import Orchestrator
 from services.api.store import db
@@ -58,14 +59,15 @@ async def lifespan(app: FastAPI):
             "Retrieved variables, citations and sentinel flags are still real."
         )
 
-    # No authentication is configured. Deliberate for this version
-    # (Requirement 20.2), but it means every endpoint is open to anyone who
-    # can reach the process. Do not expose this to the internet as-is;
-    # the Vercel proxy and a shared secret land with Task 16.2.
-    logger.warning(
-        "API has no authentication. Bind to localhost or place it behind a "
-        "trusted proxy before exposing it."
-    )
+    # There is no user login in this version (Requirement 20.2). The shared
+    # secret is what keeps a deployed API from being called directly.
+    if settings.api_shared_secret.strip():
+        logger.info("/api/chat requires X-Api-Secret (set by the web app's proxy)")
+    else:
+        logger.warning(
+            "API_SHARED_SECRET is not set: /api/chat is open to anyone who can "
+            "reach this process. Fine on localhost; set it before deploying."
+        )
 
     app.state.orchestrator = Orchestrator(gateway=gateway, embedder=embedder)
     app.state.embedder = embedder
@@ -80,8 +82,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="DIFFER API",
     description=(
-        "NHIS research assistant: codebook question answering with citations. "
-        "Verified descriptive statistics are a later phase."
+        "NHIS research assistant: codebook question answering with citations, "
+        "and verified, population-weighted descriptive statistics."
     ),
     version="0.1.0",
     lifespan=lifespan,
@@ -101,19 +103,37 @@ app.add_middleware(
     limiter=rate_limiter,
     protected_paths=("/api/chat",),
 )
+app.add_middleware(
+    SharedSecretMiddleware,
+    secret=settings.api_shared_secret,
+    protected_paths=("/api/chat",),
+)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(TimingMiddleware)
-def allowed_origins(origin: str) -> list[str]:
-    """The configured UI origin, plus its loopback twin.
 
-    http://localhost:5173 and http://127.0.0.1:5173 are different origins to a
-    browser. Opening the UI by either address is normal, and the wrong one
-    fails with a bare "failed to fetch" and no hint why.
+
+def allowed_origins(configured: str) -> list[str]:
+    """The UI origins allowed to call the API, from FRONTEND_ORIGIN.
+
+    Accepts a comma-separated list, because a deployed UI is reachable at
+    more than one origin (the production domain plus the platform's own URL).
+    Each loopback origin also gets its twin: http://localhost:5173 and
+    http://127.0.0.1:5173 are different origins to a browser, and opening the
+    UI by the "wrong" one fails with a bare "failed to fetch" and no hint why.
+    A trailing slash is dropped, since a browser's Origin header never has one.
     """
-    origins = [origin]
-    for here, there in (("//localhost", "//127.0.0.1"), ("//127.0.0.1", "//localhost")):
-        if here in origin:
-            origins.append(origin.replace(here, there))
+    origins: list[str] = []
+    for raw in configured.split(","):
+        origin = raw.strip().rstrip("/")
+        if not origin:
+            continue
+        candidates = [origin]
+        for here, there in (("//localhost", "//127.0.0.1"), ("//127.0.0.1", "//localhost")):
+            if here in origin:
+                candidates.append(origin.replace(here, there))
+        for candidate in candidates:
+            if candidate not in origins:
+                origins.append(candidate)
     return origins
 
 

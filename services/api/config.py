@@ -53,8 +53,14 @@ class Settings(BaseSettings):
     # --- HTTP ---
     frontend_origin: str = "http://localhost:5173"
 
-    # Reserved for the Vercel server-side proxy (Task 16.2, deferred).
-    # Unused while the browser talks to the API directly in local dev.
+    # Comma-separated list of UI origins allowed by CORS. Deployed, this is the
+    # web app's production URL (plus any other domain it is served from).
+    # See services.api.main.allowed_origins.
+
+    # Shared secret the Next.js server-side proxy sends as X-Api-Secret.
+    # Empty (local dev) = gate off. Set it in production so the public API URL
+    # cannot be called directly to spend the LLM quota.
+    # See services.api.middleware.shared_secret.
     api_shared_secret: str = ""
 
     @property

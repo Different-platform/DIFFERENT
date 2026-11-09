@@ -26,6 +26,21 @@ from services.api.main import allowed_origins
             ["http://127.0.0.1:5173", "http://localhost:5173"],
         ),
         ("https://differ.example.com", ["https://differ.example.com"]),
+        # Deployed: several origins, whitespace and trailing slashes tolerated.
+        (
+            "https://differ.example.com/, https://differ-web.vercel.app",
+            ["https://differ.example.com", "https://differ-web.vercel.app"],
+        ),
+        # Production plus local dev in one setting, no duplicates.
+        (
+            "https://differ.example.com,http://localhost:5173,http://127.0.0.1:5173",
+            [
+                "https://differ.example.com",
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+            ],
+        ),
+        ("", []),
     ],
 )
 def test_loopback_twin_is_allowed_but_real_hosts_are_not_widened(configured, expected):

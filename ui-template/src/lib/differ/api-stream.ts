@@ -16,7 +16,19 @@ import type { StreamEvent } from "./mock-stream";
 // so whatever else listens on ::1 at this port gets the request. Port 8000 was
 // taken by an unrelated Chroma container, which answered 404 with no CORS
 // headers and made the UI report "couldn't reach the API".
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8100";
+// Deployed builds must set VITE_API_BASE_URL (baked in at build time). The
+// localhost fallback is for `npm run dev` only: in a production build it
+// would point every visitor's browser at their own machine, so it is refused.
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL ??
+  (import.meta.env.PROD ? "" : "http://127.0.0.1:8100")
+).replace(/\/+$/, "");
+
+if (import.meta.env.PROD && !API_BASE_URL && import.meta.env.VITE_USE_MOCK !== "true") {
+  console.error(
+    "DIFFER: VITE_API_BASE_URL was not set when this site was built, so it cannot reach the API.",
+  );
+}
 
 export interface AskOptions {
   conversationId?: string | null;
