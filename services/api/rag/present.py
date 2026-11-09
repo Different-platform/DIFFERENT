@@ -1,0 +1,522 @@
+"""Turn a verified SQL result into something a researcher can use.
+
+The SQL returns what SQL returns: category *codes* (1, 2, 3, 4) and raw
+fractions (0.0161). A researcher needs "Underweight 1.6%", which population
+that covers, and what was left out. This module does that translation.
+
+It is deliberately deterministic, with no model call. Every number in the
+summary is copied from the verified result, so the prose cannot contain a
+figure the database did not produce, and it costs no tokens. Rounding is the
+only transformation applied to a value, and the exact query is shown beside
+the result so the unrounded computation stays inspectable.
+
+Everything here runs *after* verification and execution succeed. Nothing in
+this module can create a number; it can only describe one.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+from services.api.domain import Hit
+
+#: Weight and design columns: plumbing, never the thing being measured.
+_PLUMBING = frozenset({"wtfa_a", "wtia_a", "wtfa_sa", "wtia_sa", "pstrat", "ppsu"})
+
+#: The universe text that means "everyone in the Sample Adult file". Anything
+#: narrower is worth telling the reader, because a variable asked of a
+#: conditional subsample is easy to misread as covering all adults.
+_GENERIC_UNIVERSE = "sample adults 18+"
+
+
+
+@dataclass(frozen=True)
+class Presented:
+    columns: list[str]
+    rows: list[list[Any]]
+    summary: str
+
+
+def is_empty(rows: list[list[Any]]) -> bool:
+    """True when the query matched nobody (no rows, or only NULLs)."""
+    return not rows or all(value is None for row in rows for value in row)
+
+
+# ---------------------------------------------------------------------------
+# Reading the SQL
+# ---------------------------------------------------------------------------
+def variables_in(text: str | None, hits: list[Hit]) -> list[Hit]:
+    """Retrieved variables whose names appear in `text`, excluding plumbing."""
+    found: list[Hit] = []
+    seen: set[str] = set()
+    for hit in hits:
+        key = hit.variable_name.lower()
+        if key in _PLUMBING or key in seen:
+            continue
+        if re.search(rf"\b{re.escape(hit.variable_name)}\b", text or "", re.IGNORECASE):
+            seen.add(key)
+            found.append(hit)
+    return found
+
+
+def _is_word_char(char: str) -> bool:
+    return char.isalnum() or char == "_"
+
+
+def _select_list(sql: str) -> str:
+    """Text between the first SELECT and its FROM, ignoring nested subqueries."""
+    start = re.search(r"\bselect\b", sql, re.IGNORECASE)
+    if start is None:
+        return ""
+    lowered = sql.lower()
+    depth = 0
+    for i in range(start.end(), len(sql)):
+        char = sql[i]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif (
+            depth == 0
+            and lowered.startswith("from", i)
+            and not _is_word_char(lowered[i - 1])
+            and (i + 4 >= len(lowered) or not _is_word_char(lowered[i + 4]))
+        ):
+            return sql[start.end() : i]
+    return sql[start.end() :]
+
+
+def _group_by_text(sql: str) -> str | None:
+    match = re.search(
+        r"\bgroup\s+by\b(.*?)(?:\border\s+by\b|\bhaving\b|\blimit\b|$)",
+        sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    return match.group(1) if match else None
+
+
+# ---------------------------------------------------------------------------
+# Reading the result columns
+# ---------------------------------------------------------------------------
+def _metric_kind(name: str) -> str | None:
+    lowered = name.lower()
+    if any(token in lowered for token in ("proportion", "share", "percent", "pct")):
+        return "percent"
+    if any(token in lowered for token in ("mean", "average", "avg")):
+        return "mean"
+    if "count" in lowered or "total" in lowered or lowered in ("weighted_n", "n"):
+        return "count"
+    return None
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _code_text(value: Any) -> str:
+    number = _to_decimal(value)
+    if number is None:
+        return str(value)
+    return str(int(number)) if number == number.to_integral_value() else str(number)
+
+
+def _label_for(value: Any, hit: Hit) -> str | None:
+    number = _to_decimal(value)
+    if number is None:
+        return None
+    for vl in hit.value_labels:
+        if vl.code == number:
+            return vl.label.strip()
+    return None
+
+
+def _coded_cell(value: Any, hit: Hit) -> str:
+    # The label alone: "Obese", not "Obese (4)". The code is in the SQL panel
+    # for anyone who needs it, and it is noise to everyone else.
+    return _plain_label(value, hit)
+
+
+def _plain_label(value: Any, hit: Hit) -> str:
+    return _label_for(value, hit) or f"code {_code_text(value)}"
+
+
+def _format_value(value: Any, kind: str | None, *, as_fraction: bool) -> Any:
+    number = _to_decimal(value)
+    if number is None:
+        return value
+    if kind == "percent":
+        return f"{float(number) * (100 if as_fraction else 1):.1f}%"
+    if kind == "mean":
+        return round(float(number), 2)
+    if kind == "count":
+        return f"{round(float(number)):,}"
+    return round(float(number), 4) if number != number.to_integral_value() else int(number)
+
+
+def _case_target(sql: str, hits: list[Hit]) -> tuple[Hit, str] | None:
+    """The category a "share who are X" query counts, e.g. (BMICAT_A, "Obese").
+
+    Reads `CASE WHEN col = code`. Without this the summary can only say "the
+    share is 33.8%" and leaves the reader to guess which category that was.
+    """
+    match = re.search(
+        r"\bcase\s+when\s+(\w+)\s*=\s*(-?\d+(?:\.\d+)?)", sql, re.IGNORECASE
+    )
+    if match is None:
+        return None
+    hit = next(
+        (h for h in hits if h.variable_name.lower() == match.group(1).lower()), None
+    )
+    label = _label_for(match.group(2), hit) if hit is not None else None
+    return (hit, label) if hit is not None and label else None
+
+
+#: Codebook boilerplate that means nothing to a reader of the answer.
+_DESCRIPTION_NOISE: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r",?\s*public use\b", re.IGNORECASE), ""),
+    (re.compile(r"\s*\((?:top|bottom)[\s-]?coded\)", re.IGNORECASE), ""),
+    (re.compile(r"\s+of\s+(?:the\s+)?(?:SA|sample adult)\b", re.IGNORECASE), ""),
+    (re.compile(r"^(?:SA|sample adult(?:'s)?)\s+", re.IGNORECASE), ""),
+    (re.compile(r"\s+recode\b", re.IGNORECASE), ""),
+    (re.compile(r"^adult\s+", re.IGNORECASE), ""),
+    (re.compile(r"\s{2,}"), " "),
+)
+
+#: Variables BMI is worked out from (see rag/derivations.py).
+_BMI_INPUTS = frozenset({"HEIGHTTC_A", "WEIGHTLBTC_A"})
+
+
+def _topic(hit: Hit) -> str:
+    """What a variable is about, in words: "Sex of Sample Adult" -> "sex".
+
+    The variable code stays on the citation card; prose uses the topic.
+    """
+    text = (hit.description or "").strip()
+    for pattern, replacement in _DESCRIPTION_NOISE:
+        text = pattern.sub(replacement, text)
+    text = text.strip(" ,.;")
+    if not text:
+        return hit.variable_name
+    if len(text) > 1 and not text[1].isupper():  # leave acronyms like "BMI"
+        text = text[0].lower() + text[1:]
+    return text
+
+
+def _heading(hit: Hit) -> str:
+    topic = _topic(hit)
+    return topic[0].upper() + topic[1:] if topic else hit.variable_name
+
+
+def _join(hits: list[Hit]) -> str:
+    return " and ".join(_topic(hit) for hit in hits)
+
+
+def _bmi_band(value: Any) -> str | None:
+    """The standard adult BMI category a value falls in (CDC cut-offs)."""
+    number = _to_decimal(value)
+    if number is None:
+        return None
+    if number < Decimal("18.5"):
+        return "underweight"
+    if number < 25:
+        return "healthy weight"
+    if number < 30:
+        return "overweight"
+    return "obese"
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+def present_result(
+    columns: list[str],
+    rows: list[list[Any]],
+    *,
+    sql: str,
+    hits: list[Hit],
+    year: int,
+    year_assumed: bool = False,
+) -> Presented:
+    """Label the codes, format the numbers, and describe what was computed."""
+    by_name = {hit.variable_name.lower(): hit for hit in hits}
+    group_text = _group_by_text(sql)
+    group_vars = variables_in(group_text, hits) if group_text else []
+    group_names = {hit.variable_name.lower() for hit in group_vars}
+    select_vars = variables_in(_select_list(sql), hits)
+    measure_vars = [h for h in select_vars if h.variable_name.lower() not in group_names]
+    used = variables_in(sql, hits)
+
+    # A scalar built from two or more ungrouped columns is a derived measure
+    # (BMI from height and weight): no single NHIS variable holds it.
+    derived = group_text is None and len(measure_vars) >= 2
+
+    # Which result columns hold category codes? Match by name first; if the
+    # model aliased the category column, fall back to the single GROUP BY
+    # variable.
+    coded: dict[int, Hit] = {}
+    for index, name in enumerate(columns):
+        hit = by_name.get(name.lower())
+        if hit is not None and hit.value_labels:
+            coded[index] = hit
+    if (
+        not coded
+        and len(group_vars) == 1
+        and group_vars[0].value_labels
+        and columns
+        and _metric_kind(columns[0]) is None
+    ):
+        coded[0] = group_vars[0]
+
+    kinds = [None if i in coded else _metric_kind(name) for i, name in enumerate(columns)]
+
+    fraction_cols: set[int] = set()
+    for index, kind in enumerate(kinds):
+        if kind != "percent":
+            continue
+        values = [_to_decimal(row[index]) for row in rows]
+        numbers = [float(v) for v in values if v is not None]
+        if numbers and all(0 <= n <= 1.0000001 for n in numbers):
+            fraction_cols.add(index)
+
+    out_rows: list[list[Any]] = []
+    for row in rows:
+        cells: list[Any] = []
+        for index, value in enumerate(row):
+            if index in coded:
+                cells.append(_coded_cell(value, coded[index]))
+            else:
+                cells.append(
+                    _format_value(value, kinds[index], as_fraction=index in fraction_cols)
+                )
+        out_rows.append(cells)
+
+    headers: list[str] = []
+    for index, name in enumerate(columns):
+        if index in coded:
+            headers.append(_heading(coded[index]))
+        elif kinds[index] == "percent":
+            headers.append("Percent of U.S. adults")
+        elif kinds[index] == "mean":
+            headers.append("Average")
+        elif kinds[index] == "count":
+            headers.append("Estimated number of U.S. adults")
+        else:
+            headers.append(name.replace("_", " ").capitalize())
+
+    # "SUM(...) OVER (PARTITION BY sex)" means the percentages are shares
+    # *within* each sex rather than shares of everyone; the wording differs.
+    partition = re.search(r"\bpartition\s+by\b(.*?)\)", sql, re.IGNORECASE | re.DOTALL)
+    partition_vars = variables_in(partition.group(1), hits) if partition else []
+
+    summary = _summarize(
+        target=_case_target(sql, hits),
+        partition_vars=partition_vars,
+        columns=columns,
+        raw_rows=rows,
+        shown_rows=out_rows,
+        coded=coded,
+        kinds=kinds,
+        group_vars=group_vars,
+        measure_vars=measure_vars,
+        used=used,
+        derived=derived,
+        year=year,
+        year_assumed=year_assumed,
+    )
+    return Presented(columns=headers, rows=out_rows, summary=summary)
+
+
+def _summarize(
+    *,
+    columns: list[str],
+    raw_rows: list[list[Any]],
+    shown_rows: list[list[Any]],
+    coded: dict[int, Hit],
+    kinds: list[str | None],
+    group_vars: list[Hit],
+    measure_vars: list[Hit],
+    used: list[Hit],
+    partition_vars: list[Hit],
+    target: tuple[Hit, str] | None,
+    derived: bool,
+    year: int,
+    year_assumed: bool,
+) -> str:
+    scope = f"U.S. adults in {year}"
+    metric = next((i for i, kind in enumerate(kinds) if kind is not None), None)
+    metric_kind = kinds[metric] if metric is not None else None
+    sentences: list[str] = []
+
+    if year_assumed:
+        sentences.append(
+            f"No survey year was selected, so I used {year}, the most recent."
+        )
+
+    if len(coded) >= 2 and metric is not None:
+        # A two-way table. Every coded column has to appear in each label, or
+        # "Male 0.5%, Male 13.0%" reads as nonsense.
+        order = sorted(coded)
+        labelled = [
+            [_plain_label(raw[i], coded[i]) for i in order] for raw in raw_rows
+        ]
+        values = [shown[metric] for shown in shown_rows]
+        names = [_topic(coded[i]) for i in order]
+        pivot = next(
+            (
+                position
+                for position, i in enumerate(order)
+                if any(p.variable_name == coded[i].variable_name for p in partition_vars)
+            ),
+            None,
+        )
+        if pivot is not None and metric_kind == "percent":
+            groups: dict[str, list[str]] = {}
+            for labels, value in zip(labelled, values, strict=True):
+                rest = ", ".join(l for j, l in enumerate(labels) if j != pivot)
+                groups.setdefault(labels[pivot], []).append(f"{rest} {value}")
+            listing = "; ".join(f"{key}: {', '.join(parts)}" for key, parts in groups.items())
+            other = [coded[i] for j, i in enumerate(order) if j != pivot]
+            sentences.append(
+                f"Among {scope}, here is how {_join(other)} breaks down within "
+                f"each {_topic(coded[order[pivot]])} group: {listing}. "
+                f"Percentages add up to 100% within each group."
+            )
+        elif metric_kind == "percent":
+            listing = "; ".join(
+                f"{', '.join(labels)} {value}"
+                for labels, value in zip(labelled, values, strict=True)
+            )
+            sentences.append(
+                f"Share of {scope} in each combination of {' and '.join(names)} "
+                f"(all the shares together add up to 100%): {listing}."
+            )
+        else:
+            listing = "; ".join(
+                f"{', '.join(labels)}: {value}"
+                for labels, value in zip(labelled, values, strict=True)
+            )
+            sentences.append(
+                f"Results for {scope} by {' and '.join(names)}: {listing}."
+            )
+    elif coded and metric is not None:
+        subject = coded[min(coded)]
+        first = min(coded)
+        pairs = [
+            (_plain_label(raw[first], subject), shown[metric])
+            for raw, shown in zip(raw_rows, shown_rows, strict=True)
+        ]
+        listing = (
+            "; ".join(f"{label} {value}" for label, value in pairs)
+            if metric_kind != "percent"
+            else ", ".join(f"{label} {value}" for label, value in pairs)
+        )
+        if metric_kind == "percent" and target is not None:
+            # "Share who are Obese, by sex": each figure is a share *within*
+            # its group, so they do not add up to 100% and there is no
+            # "largest group" to announce.
+            sentences.append(
+                f"Share of {scope} in the \"{target[1]}\" group for "
+                f"{_topic(target[0])}, shown separately within each "
+                f"{_topic(subject)} group: {listing}. Each figure is a share of "
+                f"its own group, so they do not add up to 100%."
+            )
+        elif metric_kind == "percent":
+            sentences.append(
+                f"Here is how {scope} break down by {_topic(subject)}: {listing}."
+            )
+            raw_values = [_to_decimal(raw[metric]) for raw in raw_rows]
+            known = [v for v in raw_values if v is not None]
+            # Only a true distribution (shares summing to ~100%) has a
+            # meaningful "largest group".
+            adds_to_whole = bool(known) and (
+                abs(sum(known) - 1) < 0.01 or abs(sum(known) - 100) < 1
+            )
+            if len(pairs) > 1 and adds_to_whole:
+                best = max(
+                    range(len(pairs)),
+                    key=lambda i: raw_values[i] if raw_values[i] is not None else -1,
+                )
+                sentences.append(
+                    f"The largest group is {pairs[best][0]} ({pairs[best][1]})."
+                )
+        elif metric_kind == "mean":
+            what = _join(measure_vars) if measure_vars else "the measure"
+            sentences.append(
+                f"The average {what} for {scope}, by {_topic(subject)}: {listing}."
+            )
+        else:
+            sentences.append(
+                f"Estimated results for {scope} by {_topic(subject)}: {listing}."
+            )
+    elif len(shown_rows) == 1 and metric is not None and len(columns) == 1:
+        value = shown_rows[0][metric]
+        used_names = {hit.variable_name.upper() for hit in used}
+        if metric_kind == "mean" and derived and _BMI_INPUTS <= used_names:
+            sentences.append(f"The average BMI for {scope} was {value}.")
+            sentences.append(
+                "BMI (body mass index) compares a person's weight with their "
+                "height. It was worked out from the height and weight people "
+                "reported."
+            )
+            band = _bmi_band(value)
+            if band:
+                sentences.append(
+                    "On the CDC's adult scale (under 18.5 underweight, 18.5 to "
+                    "24.9 healthy weight, 25 to 29.9 overweight, 30 or more "
+                    f"obese), this average is in the {band} range."
+                )
+        elif metric_kind == "mean" and derived:
+            sentences.append(
+                f"The average for {scope} was {value}. NHIS does not publish "
+                f"this as a single number, so it was worked out from "
+                f"{_join(measure_vars)}."
+            )
+        elif metric_kind == "mean":
+            what = _join(measure_vars) if measure_vars else "the measure"
+            sentences.append(f"The average {what} for {scope} was {value}.")
+        elif metric_kind == "percent" and target is not None:
+            sentences.append(
+                f"About {value} of {scope} were in the \"{target[1]}\" group "
+                f"for {_topic(target[0])}."
+            )
+        elif metric_kind == "percent":
+            sentences.append(f"The share of {scope} was {value}.")
+        elif metric_kind == "count":
+            sentences.append(f"An estimated {value} {scope}.")
+        else:
+            sentences.append(f"The result for {scope} is {value}.")
+    else:
+        sentences.append(
+            f"The query returned {len(shown_rows)} row(s) for {scope}; see the "
+            f"table below."
+        )
+
+    # The exact missing-data codes are in the SQL panel; the reader only
+    # needs to know that people without an answer were not counted.
+    if any(hit.sentinel_labels for hit in used):
+        sentences.append(
+            "People who did not give a usable answer (for example, they refused "
+            "or did not know) were left out."
+        )
+
+    focus = group_vars[0] if group_vars else (measure_vars[0] if measure_vars else None)
+    universe = (focus.universe_description or "").strip() if focus else ""
+    if universe and universe.lower().rstrip(".") != _GENERIC_UNIVERSE:
+        sentences.append(f"Only some adults were asked this question: {universe}.")
+
+    sentences.append(
+        "The survey's weights make the numbers represent all U.S. adults, not "
+        "just the people interviewed."
+    )
+    return " ".join(sentences)

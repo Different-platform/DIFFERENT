@@ -1,0 +1,24 @@
+# The API image only needs Python code. Keep secrets, data, venvs, the
+# frontends and build caches out of the build context.
+.git
+.env
+.env.*
+!.env.example
+.venv
+venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.hypothesis
+.mypy_cache
+.ruff_cache
+.DS_Store
+*.csv
+*.pdf
+data
+models
+.cache
+node_modules
+apps
+ui-template
+trace_pipeline.py

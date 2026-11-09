@@ -42,7 +42,7 @@ export function MessageBubble({ message }: { message: Message }) {
       {message.content && (
         <p
           className={cn(
-            "max-w-[85ch] text-sm leading-relaxed text-foreground",
+            "max-w-[85ch] whitespace-pre-line text-sm leading-relaxed text-foreground",
             isStreaming && message.phase === "streaming" && "typing-cursor",
           )}
         >

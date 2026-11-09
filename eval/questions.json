@@ -1,0 +1,167 @@
+{
+  "_comment": "Fixed eval question set (design.md — Eval harness). Expected verdicts are grounded in the real 2019-2023 NHIS Sample Adult data loaded in Supabase. 'expect_variable' is a variable that SHOULD appear among the retrieved candidates / citations for a MEASURED or RELATED question; it is checked as membership, not as the sole answer. 'expect_verified' applies only to data-intent questions and asserts whether the generated SQL should pass verification. Keep this set small, stable, and documented — the whole point is a comparable baseline.",
+  "survey_year": 2023,
+  "questions": [
+    {
+      "id": "m1",
+      "question": "How is food insecurity measured?",
+      "expect_verdict": "MEASURED",
+      "expect_variable": "FDSCAT4_A",
+      "note": "Core food-security recode; a canonical MEASURED/codebook case."
+    },
+    {
+      "id": "m2",
+      "question": "Does NHIS measure whether an adult has ever been told they have diabetes?",
+      "expect_verdict": "MEASURED",
+      "expect_variable": "DIBEV_A",
+      "note": "Ever-told-diabetes; clearly measured."
+    },
+    {
+      "id": "m3",
+      "question": "Does the survey record a respondent's age?",
+      "expect_verdict": "MEASURED",
+      "expect_variable_any": ["AGEP_A", "AGE65"],
+      "note": "Age is measured; several age variables exist (AGEP_A continuous, AGE65 flag). Accept any of them among citations."
+    },
+    {
+      "id": "m4",
+      "question": "Is hypertension (high blood pressure) measured in NHIS?",
+      "expect_verdict": "MEASURED",
+      "expect_variable": "HYPEV_A",
+      "note": "Ever-told-hypertension."
+    },
+    {
+      "id": "d1",
+      "question": "What is the average age of adults?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_variable": "AGEP_A",
+      "expect_verified": true,
+      "note": "Weighted mean over a continuous measure; SQL must verify and execute."
+    },
+    {
+      "id": "d2",
+      "question": "What percentage of adults have ever been told they have diabetes?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_variable": "DIBEV_A",
+      "expect_verified": true,
+      "note": "Weighted proportion over a categorical measure."
+    },
+    {
+      "id": "d3",
+      "question": "What percent of adults are obese?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "note": "Share in ONE category of a categorical measure (CASE WHEN ... with missing data excluded from the denominator)."
+    },
+    {
+      "id": "b1",
+      "conversation": "bmi",
+      "question": "What is the weighted mean BMI for adults?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "note": "No single BMI variable exists in 2023; the mean must be DERIVED from height and weight, with missing codes excluded for both."
+    },
+    {
+      "id": "b2",
+      "conversation": "bmi",
+      "question": "Can you do it categorically?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "note": "Follow-up. Needs conversation memory: 'it' is the BMI mean; 'categorically' turns it into a distribution over BMI categories."
+    },
+    {
+      "id": "b3",
+      "conversation": "bmi",
+      "question": "What about 2021?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "note": "Follow-up that is meaningless without history; also checks a year in the question overrides the selector."
+    },
+    {
+      "id": "e1",
+      "conversation": "explain",
+      "question": "What's the weighted mean BMI for adults in 2023?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "note": "Sets up the explain turn below."
+    },
+    {
+      "id": "e2",
+      "conversation": "explain",
+      "question": "Explain me in detail",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "expect_result": false,
+      "expect_text": ["height", "weight"],
+      "reject_text": ["cannot be computed", "does not include a continuous", "no continuous"],
+      "note": "Regression: this used to go back through retrieval and the judge, which answered that BMI could not be computed, contradicting the answer it was asked to explain. It must explain the saved calculation and produce no new number."
+    },
+    {
+      "id": "g1",
+      "conversation": "explain",
+      "question": "How can I use this BMI in my research?",
+      "expect_verdict": "MEASURED",
+      "expect_result": false,
+      "expect_text": ["height", "weight"],
+      "reject_text": ["cannot be computed", "point estimate", "cross-sectional", "noninstitutionalized", "non-institutionalized"],
+      "note": "Regression: this was rewritten into a data question, re-ran the BMI query and repeated the same number. It must give research guidance (point estimate without a standard error, self-reported height and weight) and produce no new number."
+    },
+    {
+      "id": "w1",
+      "conversation": "why",
+      "question": "What's the weighted mean BMI for adults in 2023?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "expect_text": ["28.03"],
+      "reject_text": ["population-weighted", "WTFA_A"],
+      "note": "Plain-language summary: the number first, no jargon or variable codes in the prose. Sets up w3."
+    },
+    {
+      "id": "w2",
+      "conversation": "why",
+      "question": "BMI for 2022?",
+      "expect_verdict": "MEASURED",
+      "expect_intent": "data",
+      "expect_verified": true,
+      "expect_text": ["27.96"],
+      "note": "Follow-up that changes the year; sets up w3."
+    },
+    {
+      "id": "w3",
+      "conversation": "why",
+      "question": "What is the reason for the increase in BMI from 2022 to 2023?",
+      "expect_verdict": "MEASURED",
+      "expect_result": false,
+      "expect_text": ["27.96", "28.03", "chance"],
+      "reject_text": ["does not include any 2023", "point estimate", "cross-sectional", "PSTRAT"],
+      "note": "Regression from a screenshot: this got a wall of research caveats about 2022 alone and claimed there was no 2023 data. It must say the survey cannot show why, give both figures already shown, and say a small difference can be chance, with no new number."
+    },
+    {
+      "id": "a1",
+      "question": "What percentage of adults own a firearm?",
+      "expect_verdict": "ABSENT",
+      "note": "NHIS does not ask about firearm ownership; must refuse to cite or compute."
+    },
+    {
+      "id": "a2",
+      "question": "How many hours per week do adults spend playing video games?",
+      "expect_verdict": "ABSENT",
+      "note": "Not a concept NHIS measures."
+    },
+    {
+      "id": "r1",
+      "question": "Does NHIS measure loneliness?",
+      "expect_verdict": "RELATED",
+      "note": "No direct loneliness measure; closest is a social-support proxy. RELATED or ABSENT both acceptable interpretations — scored loosely (see runner)."
+    }
+  ]
+}
