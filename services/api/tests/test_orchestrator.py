@@ -96,6 +96,10 @@ def pipeline(monkeypatch):
         "concept_verdicts": {},  # concept -> (verdict, hit_name_or_None, why)
         "last_embedded": None,
         "decompose_calls": 0,
+        # Cross-year comparison (scope.infer_years + multi-year retrieval).
+        "loaded_years": [2019, 2020, 2021, 2022, 2023],
+        "year_hits": {},
+        "searched_years": [],
     }
 
     async def fake_classify_followup(question, prior_q, prior_a, *, gateway, earlier=""):
@@ -136,13 +140,19 @@ def pipeline(monkeypatch):
             return state["prior"]
         if operation is vector_store.search_variables:
             order.append("retrieve")
-            state["searched_year"] = kwargs.get("survey_year")
+            year = kwargs.get("survey_year")
+            state["searched_year"] = year
+            state["searched_years"].append(year)
             concept = state["last_embedded"]
+            if (concept, year) in state["year_hits"]:
+                return list(state["year_hits"][(concept, year)])
             if state["compound"] and concept in state["concept_hits"]:
                 return list(state["concept_hits"][concept])
             return list(state["hits"])
         if operation is vector_store.survey_table_exists:
             return state["survey_table_exists"]
+        if operation is vector_store.loaded_survey_years:
+            return state["loaded_years"]
         if operation is vector_store.get_variable:
             name = args[1]
             state["fetched"].append(name)
@@ -187,7 +197,7 @@ def pipeline(monkeypatch):
             return state["concept_verdicts"][question]
         verdict = state["verdict"]
         closest = hits_arg[0] if hits_arg and verdict != "ABSENT" else None
-        return verdict, closest, "because"
+        return verdict, closest, "because", ([closest] if closest else [])
 
     async def fake_compose(question, hits_arg, verdict, *, gateway):
         del question, hits_arg, verdict, gateway
@@ -823,8 +833,10 @@ async def test_a_compound_question_is_decomposed_and_retrieved_per_concept(pipel
         "race (Black vs White)": [DISTRACTOR_1],
     }
     state["concept_verdicts"] = {
-        "serious psychological distress": ("MEASURED", K6SPD_A_CLEAN, "because"),
-        "race (Black vs White)": ("MEASURED", DISTRACTOR_1, "because"),
+        "serious psychological distress": (
+            "MEASURED", K6SPD_A_CLEAN, "because", [K6SPD_A_CLEAN],
+        ),
+        "race (Black vs White)": ("MEASURED", DISTRACTOR_1, "because", [DISTRACTOR_1]),
     }
     state["intent"] = "data"
 
@@ -856,8 +868,8 @@ async def test_absent_requires_every_concept_to_be_absent(pipeline):
     state["concepts"] = ["concept A", "concept B"]
     state["concept_hits"] = {"concept A": [], "concept B": []}
     state["concept_verdicts"] = {
-        "concept A": ("ABSENT", None, "No variable records this."),
-        "concept B": ("ABSENT", None, "Nothing in the codebook addresses this."),
+        "concept A": ("ABSENT", None, "No variable records this.", []),
+        "concept B": ("ABSENT", None, "Nothing in the codebook addresses this.", []),
     }
     state["hits"] = []
 
@@ -877,8 +889,8 @@ async def test_one_measured_concept_outweighs_an_absent_one(pipeline):
     hit = make_decomposition_fixture_hit("REAL_VAR_A", 0.6, "A real variable")
     state["concept_hits"] = {"measured concept": [hit], "absent concept": []}
     state["concept_verdicts"] = {
-        "measured concept": ("MEASURED", hit, "because"),
-        "absent concept": ("ABSENT", None, "not measured"),
+        "measured concept": ("MEASURED", hit, "because", [hit]),
+        "absent concept": ("ABSENT", None, "not measured", []),
     }
     state["hits"] = [hit]
     state["intent"] = "codebook"
@@ -892,6 +904,85 @@ async def test_a_simple_question_never_calls_decompose(pipeline):
     called when the question does not look compound."""
     await run(pipeline, "How is food insecurity measured?")
     assert pipeline["state"]["decompose_calls"] == 0
+
+
+def _year_hit(name: str, year: int, similarity: float = 0.6) -> Hit:
+    return Hit(variable_name=name, survey_year=year, page=1, similarity=similarity)
+
+
+async def test_a_two_year_comparison_retrieves_against_both_years(pipeline):
+    """K6SPD_A only exists in 2021; a question comparing 2021 to 2023 must
+    search 2021 too, not just the single year scope.resolve_year() would
+    otherwise pick."""
+    state = pipeline["state"]
+    k6_2021 = _year_hit("K6SPD_A", 2021)
+    age_2023 = _year_hit("AGEP_A", 2023)
+    state["year_hits"] = {
+        ("compare psychological distress between 2021 and 2023", 2021): [k6_2021],
+        ("compare psychological distress between 2021 and 2023", 2023): [age_2023],
+    }
+    state["intent"] = "codebook"
+
+    await run(pipeline, "compare psychological distress between 2021 and 2023")
+
+    assert 2021 in pipeline["state"]["searched_years"]
+    assert 2023 in pipeline["state"]["searched_years"]
+
+
+async def test_years_outside_the_loaded_range_produce_a_coverage_note(pipeline):
+    """2017-2018 use the pre-redesign questionnaire (not loaded); 2024-2025
+    have not been released by NHIS. Both must be named, not silently
+    dropped, and distinguished from each other."""
+    state = pipeline["state"]
+    state["intent"] = "data"
+    state["survey_table_exists"] = True
+    state["generated_sql"] = "SELECT 1"
+    state["sql_result"] = readonly_store.SqlResult(columns=["x"], rows=[[1]])
+
+    events = await run(
+        pipeline, "compare rates in 2017-2019 against 2023-2025 accounting for X"
+    )
+    answer = answer_of(events)
+    assert "2017, 2018" in answer
+    assert "pre-2019 questionnaire" in answer
+    assert "2024, 2025" in answer
+    assert "not been surveyed or released" in answer
+
+
+async def test_a_two_year_statistics_question_runs_the_stats_path_per_year(pipeline):
+    state = pipeline["state"]
+    state["intent"] = "data"
+    state["survey_table_exists"] = True
+    state["generated_sql"] = "SELECT 1"
+    state["sql_result"] = readonly_store.SqlResult(columns=["x"], rows=[[1]])
+
+    events = await run(pipeline, "compare the figure in 2019 against 2023")
+    answer = answer_of(events)
+
+    assert "**2019**" in answer
+    assert "**2023**" in answer
+    # sql_gen ran once per year via the ordinary verified-statistics path,
+    # not once for a query that tried to span two years at once.
+    assert pipeline["order"].count("sql_gen") == 2
+    assert "statistical software" in answer
+
+
+async def test_when_no_requested_year_is_loaded_the_single_year_default_is_used(pipeline):
+    """A comparison entirely outside the loaded range (e.g. 1990 vs 1995)
+    must still get an answer, not silently produce nothing."""
+    state = pipeline["state"]
+    state["intent"] = "codebook"
+
+    await run(pipeline, "compare rates between 1990 and 1995", survey_year=None)
+    # Falls back to the single resolved year, exactly like an ordinary
+    # question with no year named at all.
+    assert pipeline["state"]["searched_years"] == [None]
+
+
+async def test_a_single_year_question_is_unaffected_by_multi_year_logic(pipeline):
+    """The common case: one search, exactly as before this feature existed."""
+    await run(pipeline, "How is food insecurity measured in 2021?")
+    assert pipeline["state"]["searched_years"] == [2021]
 
 
 async def test_usage_limit_is_reported_as_such_with_the_wait(pipeline, monkeypatch):

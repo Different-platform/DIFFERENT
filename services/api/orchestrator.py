@@ -27,7 +27,7 @@ from collections.abc import AsyncIterator
 from uuid import UUID
 
 from services.api import events
-from services.api.domain import Citation, Hit, RouteIntent, Verdict
+from services.api.domain import SURVEY_YEARS_MAX, Citation, Hit, RouteIntent, Verdict
 from services.api.llm.gateway import LLMGateway, LLMGatewayError, LLMRateLimitError
 from services.api.rag import (
     cite_explain,
@@ -231,6 +231,23 @@ class Orchestrator:
             if decompose.looks_compound(standalone):
                 concepts = await decompose.decompose(standalone, gateway=self.gateway)
 
+            # A question comparing two periods ("2017-2019" vs "2023-2025")
+            # needs retrieval against every year actually relevant, not the
+            # one year scope.resolve_year() picks for an ordinary question.
+            # Without this, K6SPD_A (asked only in 2021) is invisible to a
+            # question scoped to 2023 by default, regardless of how well it
+            # matches the concept — the year filter excludes it before
+            # similarity is even considered.
+            requested_years = scope.infer_years(standalone)
+            search_years: list[int | None] = [survey_year]
+            missing_years: list[int] = []
+            if len(requested_years) >= 2:
+                loaded_years = await db.run_db(vector_store.loaded_survey_years)
+                usable_years = sorted(set(requested_years) & set(loaded_years))
+                if usable_years:
+                    search_years = usable_years
+                    missing_years = sorted(set(requested_years) - set(loaded_years))
+
             per_concept_limit = (
                 RETRIEVAL_LIMIT_DATA if intent in ("data", "both") else RETRIEVAL_LIMIT
             )
@@ -240,15 +257,27 @@ class Orchestrator:
             hits_by_concept: dict[str, list[Hit]] = {}
             for concept in concepts:
                 vector = await retrieval.embed_question(concept, self.embedder)
-                hits_by_concept[concept] = await db.run_db(
-                    vector_store.search_variables,
-                    vector,
-                    survey_year=survey_year,
-                    limit=per_concept_limit,
-                )
-            hits = retrieval.dedupe_by_variable(
-                [hit for group in hits_by_concept.values() for hit in group]
+                concept_hits: list[Hit] = []
+                for year in search_years:
+                    concept_hits.extend(
+                        await db.run_db(
+                            vector_store.search_variables,
+                            vector,
+                            survey_year=year,
+                            limit=per_concept_limit,
+                        )
+                    )
+                hits_by_concept[concept] = concept_hits
+
+            # Across more than one year, two hits for the same variable are
+            # a real fact worth keeping (available in one year, not the
+            # other) rather than noise to collapse.
+            dedupe = (
+                retrieval.dedupe_by_variable_and_year
+                if len(search_years) > 1
+                else retrieval.dedupe_by_variable
             )
+            hits = dedupe([hit for group in hits_by_concept.values() for hit in group])
             if intent in ("data", "both") and survey_year is not None:
                 hits = await self._with_derivation_inputs(
                     standalone, hits, survey_year
@@ -267,13 +296,17 @@ class Orchestrator:
                 else []
             )
             by_name = {hit.variable_name: hit for hit in hits}
-            concept_verdicts: dict[str, tuple[Verdict, Hit | None, str]] | None = None
+            concept_verdicts: (
+                dict[str, tuple[Verdict, Hit | None, str, list[Hit]]] | None
+            ) = None
+            best_hits: list[Hit] = []
             if inputs and all(name in by_name for name in inputs):
                 verdict = "MEASURED"
                 closest = by_name[inputs[0]]
                 why = "Derived from " + " and ".join(inputs) + "."
+                best_hits = [closest]
             elif len(concepts) == 1:
-                verdict, closest, why = await judge.classify_presence(
+                verdict, closest, why, best_hits = await judge.classify_presence(
                     standalone, hits, gateway=self.gateway
                 )
             else:
@@ -317,23 +350,40 @@ class Orchestrator:
             else:  # MEASURED
                 # A flat top-3-by-similarity pool is how VIRAPP12M_A (the
                 # right answer to "does NHIS measure telehealth use") lost
-                # its citation slot to three merely co-retrieved variables.
-                # When the question was decomposed, give each concept that
-                # came back MEASURED/RELATED its own guaranteed slot instead.
+                # its citation slot to three merely co-retrieved variables
+                # that only out-ranked it on raw retrieval similarity, which
+                # measures topical closeness, not correctness. `best_hits`
+                # is the judge's own answer to which candidate actually
+                # answers the question, so it is cited instead. When the
+                # question was decomposed, each concept that came back
+                # MEASURED/RELATED gets its own guaranteed slot the same way.
                 citations = (
                     _citations_from_concept_verdicts(concept_verdicts, hits)
                     if concept_verdicts
-                    else generate.citations_from_hits(hits)
+                    else (
+                        [hit.to_citation() for hit in best_hits]
+                        if best_hits
+                        else generate.citations_from_hits(hits)
+                    )
                 )
                 yield events.citations(citations)
 
                 if intent in ("data", "both"):
-                    async for event, chunk in self._verified_statistics(
-                        standalone, hits, survey_year, sql_state, year_assumed
-                    ):
-                        if chunk is not None:
-                            answer_parts.append(chunk)
-                        yield event
+                    stats_years = [y for y in search_years if y is not None]
+                    if len(stats_years) > 1:
+                        async for event, chunk in self._verified_statistics_per_year(
+                            standalone, hits, stats_years, missing_years, sql_state
+                        ):
+                            if chunk is not None:
+                                answer_parts.append(chunk)
+                            yield event
+                    else:
+                        async for event, chunk in self._verified_statistics(
+                            standalone, hits, survey_year, sql_state, year_assumed
+                        ):
+                            if chunk is not None:
+                                answer_parts.append(chunk)
+                            yield event
                     # Persist the variables the query actually used, not just
                     # the top retrieval hits.
                     citations = sql_state.get("citations") or citations
@@ -768,6 +818,54 @@ class Orchestrator:
         for chunk in _chunk(text):
             yield events.token(chunk), chunk
 
+    async def _verified_statistics_per_year(
+        self,
+        question: str,
+        hits: list[Hit],
+        years: list[int],
+        missing_years: list[int],
+        sql_state: dict,
+    ) -> AsyncIterator[tuple[dict, str | None]]:
+        """A comparison across years, run as the existing single-year
+        verified-statistics path once per year, never as one query spanning
+        years it cannot verify at once.
+
+        This answers "how does X compare between 2019 and 2023" with each
+        year's own verified figure, plainly labelled, and an explicit
+        statement that no test of whether the difference is real rather than
+        chance is computed — that needs survey-design-aware software this
+        tool does not have. It does not attempt the covariate-adjusted or
+        causal comparison a full research question may also be asking for;
+        that remains out of scope regardless of which years are available.
+        """
+        for index, year in enumerate(years):
+            heading = f"**{year}**\n" if index == 0 else f"\n\n**{year}**\n"
+            yield events.token(heading), heading
+
+            year_hits = [hit for hit in hits if hit.survey_year == year] or hits
+            per_year_state: dict = {"sql": None, "verified": None, "notes": None}
+            async for event, chunk in self._verified_statistics(
+                question, year_hits, year, per_year_state, year_assumed=False
+            ):
+                if chunk is not None:
+                    chunk = f"{chunk}"
+                yield event, chunk
+            # The last year run is what query_log records; recording every
+            # year's SQL would need a schema change this does not make.
+            sql_state.update(per_year_state)
+
+        closing: list[str] = []
+        if missing_years:
+            closing.append(_year_coverage_note(missing_years))
+        closing.append(
+            "This does not include a test of whether the difference between "
+            "years is larger than would happen by chance; that needs "
+            "survey-design-aware statistical software, not this tool."
+        )
+        text = "\n\n" + " ".join(closing)
+        for chunk in _chunk(text):
+            yield events.token(chunk), chunk
+
     async def _log(
         self,
         *,
@@ -857,9 +955,12 @@ def _retrieved_summary(hits: list[Hit]) -> list[dict]:
     ]
 
 
-def _aggregate_verdict(
-    concept_verdicts: dict[str, tuple[Verdict, Hit | None, str]],
-) -> Verdict:
+#: (verdict, closest, why, best_hits) — classify_presence's full return
+#: shape, one entry per decomposed concept.
+ConceptVerdict = tuple[Verdict, "Hit | None", str, "list[Hit]"]
+
+
+def _aggregate_verdict(concept_verdicts: dict[str, ConceptVerdict]) -> Verdict:
     """ABSENT only if every concept came back ABSENT.
 
     A compound question is answerable in part whenever any one of its
@@ -869,7 +970,7 @@ def _aggregate_verdict(
     concept (or one that was never asked, if the researcher's sentence
     bundles five ideas) drag the whole thing down to a blanket refusal.
     """
-    verdicts = [v for v, _, _ in concept_verdicts.values()]
+    verdicts = [v for v, _, _, _ in concept_verdicts.values()]
     if any(v == "MEASURED" for v in verdicts):
         return "MEASURED"
     if any(v == "RELATED" for v in verdicts):
@@ -877,46 +978,85 @@ def _aggregate_verdict(
     return "ABSENT"
 
 
-def _primary_closest(
-    concept_verdicts: dict[str, tuple[Verdict, Hit | None, str]],
-) -> Hit | None:
+def _primary_closest(concept_verdicts: dict[str, ConceptVerdict]) -> Hit | None:
     """The best non-ABSENT match, for the RELATED branch's single citation.
 
     Property 3 requires RELATED to carry exactly one citation regardless of
     how many concepts were judged, so this picks one rather than letting the
     multi-concept case grow that list.
     """
-    candidates = [c for v, c, _ in concept_verdicts.values() if v != "ABSENT" and c]
+    candidates = [c for v, c, _, _ in concept_verdicts.values() if v != "ABSENT" and c]
     return max(candidates, key=lambda hit: hit.similarity, default=None)
 
 
-def _combine_why(concept_verdicts: dict[str, tuple[Verdict, Hit | None, str]]) -> str:
+def _combine_why(concept_verdicts: dict[str, ConceptVerdict]) -> str:
     """A short combined rationale, for the ABSENT message when every concept
     was absent. Joins rather than picking one, so a question naming several
     genuinely unmeasured concepts doesn't look like only one was checked."""
-    reasons = [why for _, _, why in concept_verdicts.values() if why]
+    reasons = [why for _, _, why, _ in concept_verdicts.values() if why]
     return " ".join(dict.fromkeys(reasons))  # de-duplicated, order preserved
 
 
 def _citations_from_concept_verdicts(
-    concept_verdicts: dict[str, tuple[Verdict, Hit | None, str]],
+    concept_verdicts: dict[str, ConceptVerdict],
     hits: list[Hit],
 ) -> list[Citation]:
     """One citation per concept that came back MEASURED or RELATED, each the
-    concept's own best match rather than a pool shared across all of them.
+    judge's own best match for that concept — never a pool shared across all
+    of them, and never the raw retrieval-similarity ranking, which is what
+    let a different concept's higher-scored candidates crowd out the right
+    variable for this one.
 
     Falls back to the ordinary top-similarity selection if every concept
-    somehow had no closest hit, so this never yields nothing when `hits`
-    is non-empty.
+    somehow had no judge-selected match, so this never yields nothing when
+    `hits` is non-empty.
     """
     seen: set[str] = set()
     citations: list[Citation] = []
-    for verdict, closest, _ in concept_verdicts.values():
+    for verdict, closest, _, _ in concept_verdicts.values():
         if verdict == "ABSENT" or closest is None or closest.variable_name in seen:
             continue
         seen.add(closest.variable_name)
         citations.append(closest.to_citation())
     return citations or generate.citations_from_hits(hits)
+
+
+#: The year NHIS redesigned its questionnaire. Distinct from
+#: SURVEY_YEARS_MIN (2017, the full historical range in theory): 2017-2018
+#: exist as real NHIS years but use the pre-redesign format and are not
+#: loaded by this version's parser, which only reads 2019 and later.
+_REDESIGN_YEAR = 2019
+
+
+def _year_coverage_note(missing_years: list[int]) -> str:
+    """A plain statement of which requested years are not available, and
+    why, rather than silently answering as if they were never asked about.
+
+    Two distinct reasons are worth naming separately: years before the
+    loaded range use a different, pre-redesign questionnaire NHIS has not
+    been parsed for yet; years after it have not been surveyed or released
+    by NHIS at all. Conflating the two ("not available") would make 2025
+    sound like a data-loading gap rather than a year that does not exist.
+    """
+    pre = sorted(y for y in missing_years if y < _REDESIGN_YEAR)
+    post = sorted(y for y in missing_years if y > SURVEY_YEARS_MAX)
+    other = sorted(y for y in missing_years if _REDESIGN_YEAR <= y <= SURVEY_YEARS_MAX)
+
+    parts: list[str] = []
+    if pre:
+        parts.append(
+            f"{_list_years(pre)} use NHIS's pre-2019 questionnaire, which is "
+            f"not loaded in this version"
+        )
+    if post:
+        parts.append(f"{_list_years(post)} have not been surveyed or released by NHIS yet")
+    if other:
+        parts.append(f"{_list_years(other)} are not loaded in this version")
+    return "Note: " + "; ".join(parts) + "." if parts else ""
+
+
+def _list_years(years: list[int]) -> str:
+    return ", ".join(str(y) for y in years)
 
 
 def _citations_of(prior: dict) -> list[Citation]:

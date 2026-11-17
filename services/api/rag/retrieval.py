@@ -86,3 +86,23 @@ def dedupe_by_variable(hits: list[Hit]) -> list[Hit]:
         if existing is None or hit.similarity > existing.similarity:
             best[hit.variable_name] = hit
     return sorted(best.values(), key=lambda h: h.similarity, reverse=True)
+
+
+def dedupe_by_variable_and_year(hits: list[Hit]) -> list[Hit]:
+    """Keep the highest-scoring hit per (variable name, survey year) pair.
+
+    For a question comparing two specific years, collapsing across years the
+    way `dedupe_by_variable` does would be the wrong kind of deduplication:
+    a variable asked only in one of the requested years (K6SPD_A is asked in
+    2021 and nowhere else in 2019-2023) needs its year preserved so the judge
+    and the answer can say which year it is and is not available in, rather
+    than losing that fact to a dedupe step that only ever expected one
+    relevant year at a time.
+    """
+    best: dict[tuple[str, int], Hit] = {}
+    for hit in hits:
+        key = (hit.variable_name, hit.survey_year)
+        existing = best.get(key)
+        if existing is None or hit.similarity > existing.similarity:
+            best[key] = hit
+    return sorted(best.values(), key=lambda h: h.similarity, reverse=True)
