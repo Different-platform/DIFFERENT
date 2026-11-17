@@ -19,6 +19,7 @@ from services.api.llm.gateway import Message
 from services.api.rag import (
     cite_explain,
     citation_followup,
+    decompose,
     explain,
     followup,
     generate,
@@ -87,6 +88,14 @@ def pipeline(monkeypatch):
         "citation_followup_kind": "new",
         "citation_classifier_calls": 0,
         "cite_explain_kwargs": None,
+        # Query decomposition (rag/decompose.py). Defaults keep every test
+        # above on the single-concept path unchanged.
+        "compound": False,
+        "concepts": None,
+        "concept_hits": {},  # concept -> list[Hit], only used when compound
+        "concept_verdicts": {},  # concept -> (verdict, hit_name_or_None, why)
+        "last_embedded": None,
+        "decompose_calls": 0,
     }
 
     async def fake_classify_followup(question, prior_q, prior_a, *, gateway, earlier=""):
@@ -128,6 +137,9 @@ def pipeline(monkeypatch):
         if operation is vector_store.search_variables:
             order.append("retrieve")
             state["searched_year"] = kwargs.get("survey_year")
+            concept = state["last_embedded"]
+            if state["compound"] and concept in state["concept_hits"]:
+                return list(state["concept_hits"][concept])
             return list(state["hits"])
         if operation is vector_store.survey_table_exists:
             return state["survey_table_exists"]
@@ -155,12 +167,24 @@ def pipeline(monkeypatch):
         return state["intent"]
 
     async def fake_embed(question, embedder):
-        del question, embedder
+        del embedder
+        state["last_embedded"] = question
         return [0.0] * 768
 
+    def fake_looks_compound(question):
+        del question
+        return state["compound"]
+
+    async def fake_decompose(question, *, gateway):
+        del gateway
+        state["decompose_calls"] += 1
+        return state["concepts"] or [question]
+
     async def fake_judge(question, hits_arg, *, gateway):
-        del question, gateway
+        del gateway
         order.append("judge")
+        if question in state["concept_verdicts"]:
+            return state["concept_verdicts"][question]
         verdict = state["verdict"]
         closest = hits_arg[0] if hits_arg and verdict != "ABSENT" else None
         return verdict, closest, "because"
@@ -189,6 +213,8 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(guidance, "compose", fake_guidance_compose)
     monkeypatch.setattr(citation_followup, "classify", fake_classify_citation_followup)
     monkeypatch.setattr(cite_explain, "compose", fake_cite_explain_compose)
+    monkeypatch.setattr(decompose, "looks_compound", fake_looks_compound)
+    monkeypatch.setattr(decompose, "decompose", fake_decompose)
 
     return {"order": order, "state": state, "db_ops": db_ops}
 
@@ -765,6 +791,107 @@ async def test_citation_classifier_is_not_called_after_a_computed_statistic(pipe
 async def test_citation_classifier_is_not_called_when_there_is_no_prior_turn(pipeline):
     await run(pipeline, "How is food insecurity measured?")
     assert pipeline["state"]["citation_classifier_calls"] == 0
+
+
+def make_decomposition_fixture_hit(name: str, similarity: float, description: str) -> Hit:
+    return Hit(
+        variable_name=name, survey_year=2021, page=1, similarity=similarity,
+        description=description,
+    )
+
+
+# K6SPD_A at 0.41 similarity for the full compound sentence, 0.61 for the
+# concept alone — the real numbers measured against the live corpus.
+K6SPD_A_DILUTED = make_decomposition_fixture_hit("K6SPD_A", 0.41, "Serious psychological distress")
+K6SPD_A_CLEAN = make_decomposition_fixture_hit("K6SPD_A", 0.61, "Serious psychological distress")
+DISTRACTOR_1 = make_decomposition_fixture_hit("FAMCARECVD_A", 0.53, "Caregiving during COVID")
+DISTRACTOR_2 = make_decomposition_fixture_hit("RJCLSSD1_A", 0.52, "Social distancing at work")
+
+
+async def test_a_compound_question_is_decomposed_and_retrieved_per_concept(pipeline):
+    """Reproduces the professor's exact question: 'serious psychological
+    distress' buried in a compound sentence ranked K6SPD_A outside the top
+    10; decomposed and retrieved alone it ranks first."""
+    state = pipeline["state"]
+    state["compound"] = True
+    state["concepts"] = ["serious psychological distress", "race (Black vs White)"]
+    # The pooled, non-decomposed retrieval a flat embedding would have
+    # returned — K6SPD_A diluted below two distractors.
+    state["hits"] = [DISTRACTOR_1, DISTRACTOR_2, K6SPD_A_DILUTED]
+    state["concept_hits"] = {
+        "serious psychological distress": [K6SPD_A_CLEAN],
+        "race (Black vs White)": [DISTRACTOR_1],
+    }
+    state["concept_verdicts"] = {
+        "serious psychological distress": ("MEASURED", K6SPD_A_CLEAN, "because"),
+        "race (Black vs White)": ("MEASURED", DISTRACTOR_1, "because"),
+    }
+    state["intent"] = "data"
+
+    events = await run(
+        pipeline,
+        "I want to know whether rates of serious psychological distress "
+        "differ between blacks and whites.",
+    )
+
+    assert state["decompose_calls"] == 1
+    # The judge ran once per concept, against that concept's OWN candidates —
+    # never the pooled, diluted set.
+    assert pipeline["order"].count("judge") == 2
+    assert next(e for e in events if e["type"] == "verdict")["verdict"] == "MEASURED"
+    citations = next(e for e in events if e["type"] == "citations")["citations"]
+    # K6SPD_A has a guaranteed slot: it is the concept's own best match, not
+    # out-competed by distractors from an unrelated concept in the same hits
+    # pool, which is exactly what happened before this fix.
+    assert "K6SPD_A" in {c["variable_name"] for c in citations}
+
+
+async def test_absent_requires_every_concept_to_be_absent(pipeline):
+    """The exact false claim: naming the K6 scale and declaring it unmeasured
+    when at least one concept genuinely has no NHIS variable must not drag a
+    question with a real answer down to a blanket refusal — and the reverse
+    must also hold: ABSENT only when nothing, anywhere, was measured."""
+    state = pipeline["state"]
+    state["compound"] = True
+    state["concepts"] = ["concept A", "concept B"]
+    state["concept_hits"] = {"concept A": [], "concept B": []}
+    state["concept_verdicts"] = {
+        "concept A": ("ABSENT", None, "No variable records this."),
+        "concept B": ("ABSENT", None, "Nothing in the codebook addresses this."),
+    }
+    state["hits"] = []
+
+    events = await run(pipeline, "A question about two genuinely unmeasured things.")
+    assert next(e for e in events if e["type"] == "verdict")["verdict"] == "ABSENT"
+    answer = answer_of(events)
+    # Both concepts' reasons are present, not just one of them silently
+    # dropped.
+    assert "No variable records this." in answer
+    assert "Nothing in the codebook addresses this." in answer
+
+
+async def test_one_measured_concept_outweighs_an_absent_one(pipeline):
+    state = pipeline["state"]
+    state["compound"] = True
+    state["concepts"] = ["measured concept", "absent concept"]
+    hit = make_decomposition_fixture_hit("REAL_VAR_A", 0.6, "A real variable")
+    state["concept_hits"] = {"measured concept": [hit], "absent concept": []}
+    state["concept_verdicts"] = {
+        "measured concept": ("MEASURED", hit, "because"),
+        "absent concept": ("ABSENT", None, "not measured"),
+    }
+    state["hits"] = [hit]
+    state["intent"] = "codebook"
+
+    events = await run(pipeline, "A question bundling one real thing and one absent thing.")
+    assert next(e for e in events if e["type"] == "verdict")["verdict"] == "MEASURED"
+
+
+async def test_a_simple_question_never_calls_decompose(pipeline):
+    """The common case must cost nothing extra — decompose() is never even
+    called when the question does not look compound."""
+    await run(pipeline, "How is food insecurity measured?")
+    assert pipeline["state"]["decompose_calls"] == 0
 
 
 async def test_usage_limit_is_reported_as_such_with_the_wait(pipeline, monkeypatch):

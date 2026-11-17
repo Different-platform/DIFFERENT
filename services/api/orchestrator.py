@@ -32,6 +32,7 @@ from services.api.llm.gateway import LLMGateway, LLMGatewayError, LLMRateLimitEr
 from services.api.rag import (
     cite_explain,
     citation_followup,
+    decompose,
     derivations,
     explain,
     followup,
@@ -57,6 +58,12 @@ RETRIEVAL_LIMIT = 8
 #: as BMI needs every input variable (height AND weight) to be retrieved, and a
 #: lower-ranked input silently turns "computable" into "not measured".
 RETRIEVAL_LIMIT_DATA = 10
+
+#: Per-concept limit once a question has been decomposed into more than one
+#: concept. Lower than RETRIEVAL_LIMIT/RETRIEVAL_LIMIT_DATA on purpose: each
+#: concept gets its own clean search rather than competing for a shared pool,
+#: so it does not need as many candidates to surface its own best match.
+RETRIEVAL_LIMIT_PER_CONCEPT = 6
 
 #: Extra attempts to repair SQL the verifier rejected. The repaired query must
 #: still pass the verifier; this only buys a second chance at a valid one.
@@ -210,18 +217,38 @@ class Orchestrator:
             )
 
             # --- stage 3: retrieve ---
-            vector = await retrieval.embed_question(standalone, self.embedder)
-            hits = await db.run_db(
-                vector_store.search_variables,
-                vector,
-                survey_year=survey_year,
-                limit=(
-                    RETRIEVAL_LIMIT_DATA
-                    if intent in ("data", "both")
-                    else RETRIEVAL_LIMIT
-                ),
+            # A compound question ("...rates of X between blacks and whites
+            # ... accounting for education, marital status, and insurance
+            # type") embeds as one blurred vector that matches no single
+            # concept well. "Serious psychological distress" asked alone
+            # ranks K6SPD_A #1; buried in that sentence it falls out of the
+            # top 10 entirely. Decomposing into separate concepts and
+            # retrieving each on its own is what keeps that from happening.
+            # `looks_compound` gates the extra LLM call, so a normal
+            # single-concept question pays nothing extra and this reduces to
+            # exactly the single-embedding behavior below.
+            concepts = [standalone]
+            if decompose.looks_compound(standalone):
+                concepts = await decompose.decompose(standalone, gateway=self.gateway)
+
+            per_concept_limit = (
+                RETRIEVAL_LIMIT_DATA if intent in ("data", "both") else RETRIEVAL_LIMIT
             )
-            hits = retrieval.dedupe_by_variable(hits)
+            if len(concepts) > 1:
+                per_concept_limit = RETRIEVAL_LIMIT_PER_CONCEPT
+
+            hits_by_concept: dict[str, list[Hit]] = {}
+            for concept in concepts:
+                vector = await retrieval.embed_question(concept, self.embedder)
+                hits_by_concept[concept] = await db.run_db(
+                    vector_store.search_variables,
+                    vector,
+                    survey_year=survey_year,
+                    limit=per_concept_limit,
+                )
+            hits = retrieval.dedupe_by_variable(
+                [hit for group in hits_by_concept.values() for hit in group]
+            )
             if intent in ("data", "both") and survey_year is not None:
                 hits = await self._with_derivation_inputs(
                     standalone, hits, survey_year
@@ -240,14 +267,29 @@ class Orchestrator:
                 else []
             )
             by_name = {hit.variable_name: hit for hit in hits}
+            concept_verdicts: dict[str, tuple[Verdict, Hit | None, str]] | None = None
             if inputs and all(name in by_name for name in inputs):
                 verdict = "MEASURED"
                 closest = by_name[inputs[0]]
                 why = "Derived from " + " and ".join(inputs) + "."
-            else:
+            elif len(concepts) == 1:
                 verdict, closest, why = await judge.classify_presence(
                     standalone, hits, gateway=self.gateway
                 )
+            else:
+                # Judge each concept against its OWN retrieved candidates,
+                # never the pooled set — the entire point is that a judge
+                # given all 5-6 concepts' candidates at once sees the same
+                # diluted pool retrieval just escaped.
+                concept_verdicts = {
+                    concept: await judge.classify_presence(
+                        concept, hits_by_concept[concept], gateway=self.gateway
+                    )
+                    for concept in concepts
+                }
+                verdict = _aggregate_verdict(concept_verdicts)
+                closest = _primary_closest(concept_verdicts)
+                why = _combine_why(concept_verdicts)
             yield events.verdict(verdict)
 
             # --- stage 5: answer, branching on verdict then intent ---
@@ -273,7 +315,16 @@ class Orchestrator:
                     yield events.token(chunk)
 
             else:  # MEASURED
-                citations = generate.citations_from_hits(hits)
+                # A flat top-3-by-similarity pool is how VIRAPP12M_A (the
+                # right answer to "does NHIS measure telehealth use") lost
+                # its citation slot to three merely co-retrieved variables.
+                # When the question was decomposed, give each concept that
+                # came back MEASURED/RELATED its own guaranteed slot instead.
+                citations = (
+                    _citations_from_concept_verdicts(concept_verdicts, hits)
+                    if concept_verdicts
+                    else generate.citations_from_hits(hits)
+                )
                 yield events.citations(citations)
 
                 if intent in ("data", "both"):
@@ -804,6 +855,68 @@ def _retrieved_summary(hits: list[Hit]) -> list[dict]:
         }
         for hit in hits
     ]
+
+
+def _aggregate_verdict(
+    concept_verdicts: dict[str, tuple[Verdict, Hit | None, str]],
+) -> Verdict:
+    """ABSENT only if every concept came back ABSENT.
+
+    A compound question is answerable in part whenever any one of its
+    concepts is measured — "is race measured? is insurance type measured?
+    is psychological distress measured?" each has its own true answer, and
+    the question should report what IS there rather than let one absent
+    concept (or one that was never asked, if the researcher's sentence
+    bundles five ideas) drag the whole thing down to a blanket refusal.
+    """
+    verdicts = [v for v, _, _ in concept_verdicts.values()]
+    if any(v == "MEASURED" for v in verdicts):
+        return "MEASURED"
+    if any(v == "RELATED" for v in verdicts):
+        return "RELATED"
+    return "ABSENT"
+
+
+def _primary_closest(
+    concept_verdicts: dict[str, tuple[Verdict, Hit | None, str]],
+) -> Hit | None:
+    """The best non-ABSENT match, for the RELATED branch's single citation.
+
+    Property 3 requires RELATED to carry exactly one citation regardless of
+    how many concepts were judged, so this picks one rather than letting the
+    multi-concept case grow that list.
+    """
+    candidates = [c for v, c, _ in concept_verdicts.values() if v != "ABSENT" and c]
+    return max(candidates, key=lambda hit: hit.similarity, default=None)
+
+
+def _combine_why(concept_verdicts: dict[str, tuple[Verdict, Hit | None, str]]) -> str:
+    """A short combined rationale, for the ABSENT message when every concept
+    was absent. Joins rather than picking one, so a question naming several
+    genuinely unmeasured concepts doesn't look like only one was checked."""
+    reasons = [why for _, _, why in concept_verdicts.values() if why]
+    return " ".join(dict.fromkeys(reasons))  # de-duplicated, order preserved
+
+
+def _citations_from_concept_verdicts(
+    concept_verdicts: dict[str, tuple[Verdict, Hit | None, str]],
+    hits: list[Hit],
+) -> list[Citation]:
+    """One citation per concept that came back MEASURED or RELATED, each the
+    concept's own best match rather than a pool shared across all of them.
+
+    Falls back to the ordinary top-similarity selection if every concept
+    somehow had no closest hit, so this never yields nothing when `hits`
+    is non-empty.
+    """
+    seen: set[str] = set()
+    citations: list[Citation] = []
+    for verdict, closest, _ in concept_verdicts.values():
+        if verdict == "ABSENT" or closest is None or closest.variable_name in seen:
+            continue
+        seen.add(closest.variable_name)
+        citations.append(closest.to_citation())
+    return citations or generate.citations_from_hits(hits)
 
 
 def _citations_of(prior: dict) -> list[Citation]:
