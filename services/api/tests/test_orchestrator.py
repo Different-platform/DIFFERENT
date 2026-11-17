@@ -17,6 +17,8 @@ from services.api.domain import Hit, ValueLabel
 from services.api.llm.gateway import FakeLLMGateway
 from services.api.llm.gateway import Message
 from services.api.rag import (
+    cite_explain,
+    citation_followup,
     explain,
     followup,
     generate,
@@ -82,6 +84,9 @@ def pipeline(monkeypatch):
         "followup_kind": "new",
         "classifier_calls": 0,
         "guidance_kwargs": None,
+        "citation_followup_kind": "new",
+        "citation_classifier_calls": 0,
+        "cite_explain_kwargs": None,
     }
 
     async def fake_classify_followup(question, prior_q, prior_a, *, gateway, earlier=""):
@@ -89,6 +94,11 @@ def pipeline(monkeypatch):
         state["classifier_earlier"] = earlier
         state["classifier_calls"] += 1
         return state["followup_kind"]
+
+    async def fake_classify_citation_followup(question, prior_q, prior_a, *, gateway):
+        del question, prior_q, prior_a, gateway
+        state["citation_classifier_calls"] += 1
+        return state["citation_followup_kind"]
 
     async def fake_explain_compose(**kwargs):
         order.append("explain")
@@ -98,6 +108,11 @@ def pipeline(monkeypatch):
         order.append("guidance")
         state["guidance_kwargs"] = kwargs
         return "Use it as a descriptive point estimate; it has no standard error."
+
+    async def fake_cite_explain_compose(**kwargs):
+        order.append("cite_explain")
+        state["cite_explain_kwargs"] = kwargs
+        return "FDSCAT4_A is the one most researchers use."
 
     async def fake_run_db(operation, *args, **kwargs):
         if operation is relational_store.ensure_conversation:
@@ -172,6 +187,8 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(followup, "classify", fake_classify_followup)
     monkeypatch.setattr(explain, "compose", fake_explain_compose)
     monkeypatch.setattr(guidance, "compose", fake_guidance_compose)
+    monkeypatch.setattr(citation_followup, "classify", fake_classify_citation_followup)
+    monkeypatch.setattr(cite_explain, "compose", fake_cite_explain_compose)
 
     return {"order": order, "state": state, "db_ops": db_ops}
 
@@ -636,6 +653,118 @@ async def test_classifier_is_not_called_when_the_last_answer_has_no_computation(
 async def test_classifier_is_not_called_on_the_first_message(pipeline):
     await run(pipeline, "How is food insecurity measured?")
     assert pipeline["state"]["classifier_calls"] == 0
+
+
+def citation_turn(state, verdict="MEASURED"):
+    """A prior turn that named a codebook variable, with no computed SQL."""
+    state["history"] = [
+        Message(role="user", content="Does NHIS measure loneliness or social isolation?"),
+        Message(
+            role="assistant",
+            content=(
+                "The closest NHIS item is RJWRKCLSSD_A, which asks how often a "
+                "worker had to stay within six feet of others during COVID-19 "
+                "social distancing. It captures workplace proximity, not "
+                "personal feelings of loneliness."
+            ),
+        ),
+    ]
+    state["prior"] = {
+        "id": 1,
+        "content": state["history"][-1].content,
+        "citations": [
+            {
+                "variable_name": "RJWRKCLSSD_A",
+                "section": "Social distancing at work",
+                "page": 576,
+                "survey_year": 2020,
+                "description": "Work close to others with social distancing in effect",
+                "question_text": None,
+            }
+        ],
+        "verdict": verdict,
+        "generated_sql": None,
+        "sql_verified": None,
+    }
+
+
+async def test_about_citations_is_answered_without_retrieval_or_the_judge(pipeline):
+    """The exact bug: 'which one is most used' was judged ABSENT instead of
+    being answered from the variables already named."""
+    state = pipeline["state"]
+    citation_turn(state)
+    state["citation_followup_kind"] = "about_citations"
+
+    events = await run(pipeline, "Which of those is the one most researchers use?")
+    order = pipeline["order"]
+    kinds = types_of(events)
+
+    assert "retrieve" not in order and "judge" not in order
+    assert "rewrite" not in order
+    assert "cite_explain" in order
+    # The verdict is echoed from the prior turn, never re-decided.
+    assert next(e for e in events if e["type"] == "verdict")["verdict"] == "MEASURED"
+    assert "most researchers use" in answer_of(events)
+    assert kinds[0] == "route" and kinds[-1] == "done"
+    assert len(state["logged"]) == 1 and state["logged"][0]["intent"] == "codebook"
+
+
+async def test_about_citations_is_grounded_in_the_specific_variable_already_named(pipeline):
+    """The exact bug: 'why doesn't that one count' drifted to a different,
+    merely similar variable (RJCLSSD1_A) than the one just named."""
+    state = pipeline["state"]
+    citation_turn(state, verdict="RELATED")
+    state["citation_followup_kind"] = "about_citations"
+    state["fetchable"] = {"RJWRKCLSSD_A": make_hit("RJWRKCLSSD_A", page=576)}
+
+    events = await run(pipeline, "Why doesn't that one count as measuring it?")
+
+    assert pipeline["order"].count("cite_explain") == 1
+    # The composer was given exactly the previously-cited variable to work
+    # from — never a fresh retrieval result that could resolve to something
+    # else with a similar name.
+    variables = state["cite_explain_kwargs"]["variables"]
+    assert [v.variable_name for v in variables] == ["RJWRKCLSSD_A"]
+    assert state["fetched"] == ["RJWRKCLSSD_A"]
+
+
+async def test_a_metadata_question_about_citations_skips_the_llm_entirely(pipeline):
+    state = pipeline["state"]
+    citation_turn(state)
+    state["citation_followup_kind"] = "about_citations"
+
+    events = await run(pipeline, "What page is that on?")
+    assert "cite_explain" not in pipeline["order"]
+    # No re-fetch either: the answer comes straight from the citation record.
+    assert state["fetched"] == []
+    assert "576" in answer_of(events)
+
+
+async def test_a_new_concept_after_a_citation_answer_takes_the_normal_pipeline(pipeline):
+    state = pipeline["state"]
+    citation_turn(state)
+    state["citation_followup_kind"] = "new"
+
+    await run(pipeline, "How is poverty measured?")
+    assert state["citation_classifier_calls"] == 1
+    order = pipeline["order"]
+    assert "retrieve" in order
+    assert "cite_explain" not in order
+
+
+async def test_citation_classifier_is_not_called_after_a_computed_statistic(pipeline):
+    """A prior turn with SQL uses the stats classifier, never this one."""
+    state = pipeline["state"]
+    computed_turn(state)
+    state["followup_kind"] = "new"
+
+    await run(pipeline, "What about 2021?")
+    assert state["citation_classifier_calls"] == 0
+
+
+async def test_citation_classifier_is_not_called_when_there_is_no_prior_turn(pipeline):
+    await run(pipeline, "How is food insecurity measured?")
+    assert pipeline["state"]["citation_classifier_calls"] == 0
 
 
 async def test_usage_limit_is_reported_as_such_with_the_wait(pipeline, monkeypatch):

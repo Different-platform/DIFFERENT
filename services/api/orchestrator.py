@@ -30,6 +30,8 @@ from services.api import events
 from services.api.domain import Citation, Hit, RouteIntent, Verdict
 from services.api.llm.gateway import LLMGateway, LLMGatewayError, LLMRateLimitError
 from services.api.rag import (
+    cite_explain,
+    citation_followup,
     derivations,
     explain,
     followup,
@@ -114,59 +116,82 @@ class Orchestrator:
                 content=question,
             )
 
-            # --- "explain that" / "how do I use this": answer from the
-            # computation that ran ---
+            # --- a follow-up about the previous answer: answer from what was
+            # already said, not from a fresh search ---
             # A request about the previous answer must not go back through
-            # retrieval and the judge, which never saw that computation and
-            # can contradict it, nor re-run the query and repeat the number.
-            # Only considered when the last turn was a computed, verified
-            # statistic.
+            # retrieval and the judge, which never saw that answer and can
+            # contradict it, nor re-run a query and repeat the number. Two
+            # shapes of prior answer get this treatment, each with its own
+            # classifier because the examples that distinguish "about this"
+            # from "a new question" differ between them:
+            #   - a computed, verified statistic (rag/followup.py)
+            #   - a codebook citation with no SQL (rag/citation_followup.py)
             prior = (
                 await db.run_db(relational_store.load_last_assistant, conversation_uuid)
                 if history
                 else None
             )
-            if prior and prior.get("generated_sql") and prior.get("sql_verified"):
+            if prior:
                 prior_question = next(
                     (m.content for m in reversed(history) if m.role == "user"), ""
                 )
-                # Earlier answers let "why did it go up from 2022 to 2023?" be
-                # recognised as a question about figures already shown.
-                earlier = " | ".join(
-                    m.content[:200]
-                    for m in history[:-1][-guidance.EARLIER_MESSAGES:]
-                    if m.role == "assistant"
-                )
-                kind = await followup.classify(
-                    question,
-                    prior_question,
-                    prior["content"],
-                    gateway=self.gateway,
-                    earlier=earlier,
-                )
-                if kind == "explain":
-                    async for event in self._explain_previous(
+                if prior.get("generated_sql") and prior.get("sql_verified"):
+                    # Earlier answers let "why did it go up from 2022 to
+                    # 2023?" be recognised as a question about figures
+                    # already shown.
+                    earlier = " | ".join(
+                        m.content[:200]
+                        for m in history[:-1][-guidance.EARLIER_MESSAGES:]
+                        if m.role == "assistant"
+                    )
+                    kind = await followup.classify(
                         question,
-                        prior,
                         prior_question,
-                        conversation_uuid,
-                        started,
-                        sql_state,
-                    ):
-                        yield event
-                    return
-                if kind == "guidance":
-                    async for event in self._guide_previous(
+                        prior["content"],
+                        gateway=self.gateway,
+                        earlier=earlier,
+                    )
+                    if kind == "explain":
+                        async for event in self._explain_previous(
+                            question,
+                            prior,
+                            prior_question,
+                            conversation_uuid,
+                            started,
+                            sql_state,
+                        ):
+                            yield event
+                        return
+                    if kind == "guidance":
+                        async for event in self._guide_previous(
+                            question,
+                            prior,
+                            prior_question,
+                            conversation_uuid,
+                            started,
+                            sql_state,
+                            history,
+                        ):
+                            yield event
+                        return
+                elif prior.get("citations"):
+                    kind = await citation_followup.classify(
                         question,
-                        prior,
                         prior_question,
-                        conversation_uuid,
-                        started,
-                        sql_state,
-                        history,
-                    ):
-                        yield event
-                    return
+                        prior["content"],
+                        gateway=self.gateway,
+                    )
+                    if kind == "about_citations":
+                        async for event in self._explain_citations(
+                            question,
+                            prior,
+                            prior_question,
+                            conversation_uuid,
+                            started,
+                            sql_state,
+                        ):
+                            yield event
+                        return
 
             # --- stage 1: rewrite follow-ups into a standalone question ---
             standalone = await rewrite.to_standalone(
@@ -385,6 +410,78 @@ class Orchestrator:
         )
         yield events.done(message_id)
 
+    async def _explain_citations(
+        self,
+        question: str,
+        prior: dict,
+        prior_question: str,
+        conversation_uuid,
+        started: float,
+        sql_state: dict,
+    ) -> AsyncIterator[dict]:
+        """Answer a follow-up about variables already cited in a codebook
+        answer ("which one is better", "why doesn't that one count", "what
+        page is that on").
+
+        No retrieval, no judge: the only variables this can ever discuss are
+        the ones already cited, fetched again only for their full codebook
+        detail (universe, value labels) rather than re-searched. That is what
+        makes it structurally impossible to drift to a different, merely
+        similar variable than the one the researcher is actually asking
+        about.
+        """
+        verdict = prior.get("verdict") or "MEASURED"
+        citations = _citations_of(prior)
+
+        yield events.route("codebook")
+        yield events.verdict(verdict)
+        if citations:
+            yield events.citations(citations)
+
+        # Pure metadata (page/year/section) is answered straight from the
+        # citation record, with no DB re-fetch and no LLM call at all.
+        text = cite_explain.metadata_answer(citations, question)
+        if text is None:
+            variables = await self._variables_of_citations(citations)
+            text = await cite_explain.compose(
+                question=question,
+                prior_question=prior_question,
+                prior_answer=prior["content"],
+                variables=variables,
+                gateway=self.gateway,
+            )
+        for chunk in _chunk(text):
+            yield events.token(chunk)
+
+        message_id = await self._save_followup(
+            text, prior, citations, verdict, conversation_uuid
+        )
+        sql_state.update(sql=None, verified=None, notes=None)
+        await self._log(
+            question=question,
+            standalone=question,
+            conversation_uuid=conversation_uuid,
+            message_id=message_id,
+            intent="codebook",
+            verdict=verdict,
+            hits=[],
+            started=started,
+            sql_state=sql_state,
+        )
+        yield events.done(message_id)
+
+    async def _variables_of_citations(self, citations: list[Citation]) -> list[Hit]:
+        """Full codebook detail for variables already cited, re-fetched by
+        name/year rather than re-retrieved by meaning."""
+        variables: list[Hit] = []
+        for citation in citations:
+            found = await db.run_db(
+                vector_store.get_variable, citation.survey_year, citation.variable_name
+            )
+            if found is not None:
+                variables.append(found)
+        return variables
+
     async def _guide_previous(
         self,
         question: str,
@@ -465,8 +562,11 @@ class Orchestrator:
     ) -> int:
         """Save a reply about the previous answer.
 
-        The SQL is carried forward so a further "explain more" or "how do I
-        use this" still has the computation to talk about.
+        The SQL (if any) is carried forward so a further "explain more" or
+        "how do I use this" still has the computation to talk about.
+        `sql_verified` is taken from `prior` rather than hardcoded: a
+        citation-only prior has no SQL, and claiming one was verified here
+        would be false.
         """
         return await db.run_db(
             relational_store.insert_message,
@@ -476,7 +576,7 @@ class Orchestrator:
             citations=citations or None,
             verdict=verdict,
             generated_sql=prior["generated_sql"],
-            sql_verified=True,
+            sql_verified=prior.get("sql_verified"),
         )
 
     async def _with_derivation_inputs(
