@@ -52,9 +52,19 @@ things like a health condition or behavior, a demographic group, an \
 insurance or coverage type, a time period, or an educational or marital \
 characteristic.
 
-Return each concept as a short phrase in the researcher's own words, \
-naming ONE concept each. Do not merge unrelated concepts into one phrase, \
-and do not split a single concept into several near-duplicates.
+Phrase each concept as the plain, measurable thing a household health \
+survey would actually ask someone ("telehealth use", "virtual medical \
+visit"), not the policy, program, or administrative framing the researcher \
+used to explain why they care about it ("CMS's expansion of telehealth \
+reimbursement", "the March 2020 policy change"). Surveys ask about what \
+happened to a person, not about the regulation that made it possible — a \
+policy or program name alone is not something NHIS has a variable for, so \
+translate it to the underlying behavior, condition, or circumstance it \
+would show up as in survey data.
+
+Return each concept as a short phrase, naming ONE concept each. Do not \
+merge unrelated concepts into one phrase, and do not split a single \
+concept into several near-duplicates.
 
 If the question already asks about only one concept, return a list \
 containing just that one question, unchanged.

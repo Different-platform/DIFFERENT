@@ -77,6 +77,21 @@ async def test_a_single_concept_question_returns_itself_unchanged():
     assert result == ["How is BMI measured?"]
 
 
+def test_prompt_tells_the_model_to_normalize_policy_framing():
+    """Regression guard for the professor's telehealth-reimbursement question.
+
+    Decomposing "CMS's expansion of telehealth reimbursement in March 2020"
+    into a concept that keeps that policy phrasing embeds nowhere near NHIS's
+    plain-language variable descriptions (VIRAPP12M_A, "Virtual medical
+    appointment, past 12m"), so the judge sees no matching candidate and the
+    system wrongly claims NHIS does not measure telehealth at all. The system
+    prompt must steer the model to translate policy/program framing into the
+    underlying measurable concept instead of preserving it verbatim.
+    """
+    assert "policy" in decompose.SYSTEM_PROMPT.lower()
+    assert "measurable" in decompose.SYSTEM_PROMPT.lower()
+
+
 async def test_the_motivating_compound_question_splits_into_its_concepts():
     gateway = FakeLLMGateway(
         responses=[
