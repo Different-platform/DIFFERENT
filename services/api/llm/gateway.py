@@ -17,9 +17,13 @@ question.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
 
 Role = Literal["system", "user", "assistant"]
 ResponseFormat = Literal["text", "json"]
@@ -148,7 +152,6 @@ class GroqGateway:
         response_format: ResponseFormat = "text",
         stage: str | None = None,
     ) -> LLMResponse:
-        del stage  # used only by the fake gateway and logging
         kwargs: dict = {
             "model": self.model,
             "messages": self._payload(system, messages),
@@ -157,11 +160,27 @@ class GroqGateway:
         if response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
 
+        # Elapsed time here is overwhelmingly the model's own generation
+        # time on Groq's side (network/queueing), not anything this process
+        # does — logged per stage so a slow question is attributable to a
+        # specific call (router/judge/sql_gen/generate) instead of only
+        # knowing "one of the 3-5 calls this question made was slow".
+        started = time.monotonic()
         try:
             completion = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "groq complete stage=%s model=%s failed after %dms: %s",
+                stage, self.model, elapsed_ms, exc,
+            )
             raise _translate_provider_error(exc, "completion") from exc
 
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        logger.info(
+            "groq complete stage=%s model=%s took %dms",
+            stage, self.model, elapsed_ms,
+        )
         choice = completion.choices[0].message.content or ""
         return LLMResponse(text=choice, model=self.model)
 
@@ -173,7 +192,8 @@ class GroqGateway:
         temperature: float = 0.0,
         stage: str | None = None,
     ) -> AsyncIterator[str]:
-        del stage
+        started = time.monotonic()
+        first_token_ms: int | None = None
         try:
             response = await self._client.chat.completions.create(
                 model=self.model,
@@ -184,9 +204,22 @@ class GroqGateway:
             async for chunk in response:
                 delta = chunk.choices[0].delta.content
                 if delta:
+                    if first_token_ms is None:
+                        first_token_ms = int((time.monotonic() - started) * 1000)
                     yield delta
         except Exception as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "groq stream stage=%s model=%s failed after %dms (first_token=%s): %s",
+                stage, self.model, elapsed_ms, first_token_ms, exc,
+            )
             raise _translate_provider_error(exc, "stream") from exc
+        else:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.info(
+                "groq stream stage=%s model=%s took %dms total, %sms to first token",
+                stage, self.model, elapsed_ms, first_token_ms,
+            )
 
 
 #: Signature of a fake gateway's response policy.
