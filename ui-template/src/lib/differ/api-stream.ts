@@ -36,10 +36,19 @@ export interface AskOptions {
   signal?: AbortSignal;
 }
 
-/** SSE frames are separated by a blank line; each `data:` line carries JSON. */
+/**
+ * SSE frames are separated by a blank line; each `data:` line carries JSON.
+ *
+ * sse-starlette terminates lines with \r\n, so the separator on the wire is
+ * \r\n\r\n, not a bare \n\n. Splitting on "\n\n" never matches that sequence
+ * (there is a \r sitting between the two \n characters), so this used to
+ * silently drop every single event — the fetch completed with no error, but
+ * no StreamEvent was ever produced, which is indistinguishable from "nothing
+ * happened" in the UI. Confirmed against the real backend's raw bytes.
+ */
 function parseFrames(buffer: string): { events: StreamEvent[]; rest: string } {
   const events: StreamEvent[] = [];
-  const parts = buffer.split("\n\n");
+  const parts = buffer.split(/\r?\n\r?\n/);
   // The trailing element may be an incomplete frame; keep it buffered.
   const rest = parts.pop() ?? "";
 

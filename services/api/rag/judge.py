@@ -61,8 +61,18 @@ provided for context only; a high score does not make a variable the right \
 answer, and a low score does not make it wrong. Being candid that NHIS lacks \
 a measure is a correct and useful answer, never a failure.
 
+Also name which retrieved variable(s) actually answer the question, in \
+"best": up to 3 variable names, in order, using exactly the names printed \
+above (never a name you were not given). For MEASURED this is the \
+variable(s) that directly capture the concept — the retrieval score ranks \
+by topical closeness, not by which variable is actually the right one, so \
+decide this yourself rather than assuming the top-scored candidate is the \
+answer. For RELATED, name exactly one: the single closest candidate. For \
+ABSENT, "best" is an empty list.
+
 Respond with JSON only:
-{"verdict": "MEASURED" | "RELATED" | "ABSENT", "why": "<one or two sentences>"}\
+{"verdict": "MEASURED" | "RELATED" | "ABSENT", "why": "<one or two sentences>", \
+"best": ["VARNAME", ...]}\
 """
 
 
@@ -104,11 +114,13 @@ def build_prompt(question: str, hits: list[Hit]) -> str:
     )
 
 
-def _parse_verdict(raw: str) -> tuple[Verdict | None, str]:
-    """Extract (verdict, why) from a model response, tolerating stray prose."""
+def _parse_verdict(raw: str) -> tuple[Verdict | None, str, list[str]]:
+    """Extract (verdict, why, best_names) from a model response, tolerating
+    stray prose. `best_names` is unvalidated here — the caller must check
+    each name against the actual candidate set before trusting it."""
     text = raw.strip()
     if not text:
-        return None, ""
+        return None, "", []
 
     # Models sometimes wrap JSON in fences or commentary.
     start, end = text.find("{"), text.rfind("}")
@@ -121,14 +133,20 @@ def _parse_verdict(raw: str) -> tuple[Verdict | None, str]:
         upper = raw.upper()
         for candidate in ("ABSENT", "RELATED", "MEASURED"):
             if candidate in upper:
-                return candidate, ""  # type: ignore[return-value]
-        return None, ""
+                return candidate, "", []  # type: ignore[return-value]
+        return None, "", []
 
     verdict = str(payload.get("verdict", "")).strip().upper()
     why = str(payload.get("why", "")).strip()
+    raw_best = payload.get("best")
+    best_names = (
+        [str(n).strip() for n in raw_best if isinstance(n, str) and n.strip()]
+        if isinstance(raw_best, list)
+        else []
+    )
     if verdict in VALID_VERDICTS:
-        return verdict, why  # type: ignore[return-value]
-    return None, why
+        return verdict, why, best_names  # type: ignore[return-value]
+    return None, why, best_names
 
 
 async def classify_presence(
@@ -136,20 +154,33 @@ async def classify_presence(
     hits: list[Hit],
     *,
     gateway: LLMGateway,
-) -> tuple[Verdict, Hit | None, str]:
-    """Return (verdict, closest_hit, rationale).
+) -> tuple[Verdict, Hit | None, str, list[Hit]]:
+    """Return (verdict, closest_hit, rationale, best_hits).
 
-    `closest_hit` is the top-ranked candidate, which the orchestrator presents
-    for a RELATED verdict and withholds for ABSENT.
+    `closest_hit` is `best_hits[0]`, kept as its own return value because
+    existing callers already unpack it that way. `best_hits` is the judge's
+    own answer to "which retrieved variable(s) actually answer this
+    question" — never the raw retrieval-similarity ranking, which measures
+    topical closeness, not correctness. That distinction is exactly what let
+    VIRAPP12M_A (the real telehealth-use variable, retrieval rank 5) lose its
+    citation to three higher-ranked but less-relevant internet-health
+    variables: nothing had ever asked the model which one was actually
+    right. Every name in `best_hits` is validated against the hits the model
+    was actually shown; an invented name is dropped, never trusted.
 
     With nothing retrieved the verdict is ABSENT without consulting the model:
     there is no construct to compare against, and an LLM call could only
     hallucinate one.
     """
     if not hits:
-        return "ABSENT", None, "No codebook variables were retrieved for this question."
+        return (
+            "ABSENT",
+            None,
+            "No codebook variables were retrieved for this question.",
+            [],
+        )
 
-    closest = hits[0]
+    by_name = {hit.variable_name: hit for hit in hits}
 
     try:
         response = await gateway.complete(
@@ -162,7 +193,8 @@ async def classify_presence(
     except LLMGatewayError:
         raise
 
-    verdict, why = _parse_verdict(response.text)
+    verdict, why, raw_best = _parse_verdict(response.text)
+    best_hits = [by_name[name] for name in raw_best if name in by_name]
 
     if verdict is None:
         # Refusing to guess: an unparseable judgement is reported as RELATED,
@@ -171,12 +203,22 @@ async def classify_presence(
         logger.warning(
             "presence judge returned an unparseable verdict: %r", response.text[:200]
         )
+        fallback = best_hits[:1] or [hits[0]]
         return (
             "RELATED",
-            closest,
+            fallback[0],
             "The presence check did not return a usable verdict, so this "
             "variable is offered as the closest match rather than a "
             "confirmed one.",
+            fallback,
         )
 
-    return verdict, (None if verdict == "ABSENT" else closest), why
+    if verdict == "ABSENT":
+        return verdict, None, why, []
+
+    # The model naming nothing validatable degrades to the old behavior
+    # (top retrieval rank) rather than returning an answer with no citation.
+    if not best_hits:
+        best_hits = [hits[0]]
+
+    return verdict, best_hits[0], why, best_hits

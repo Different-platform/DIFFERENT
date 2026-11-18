@@ -17,6 +17,9 @@ from services.api.domain import Hit, ValueLabel
 from services.api.llm.gateway import FakeLLMGateway
 from services.api.llm.gateway import Message
 from services.api.rag import (
+    cite_explain,
+    citation_followup,
+    decompose,
     explain,
     followup,
     generate,
@@ -82,6 +85,21 @@ def pipeline(monkeypatch):
         "followup_kind": "new",
         "classifier_calls": 0,
         "guidance_kwargs": None,
+        "citation_followup_kind": "new",
+        "citation_classifier_calls": 0,
+        "cite_explain_kwargs": None,
+        # Query decomposition (rag/decompose.py). Defaults keep every test
+        # above on the single-concept path unchanged.
+        "compound": False,
+        "concepts": None,
+        "concept_hits": {},  # concept -> list[Hit], only used when compound
+        "concept_verdicts": {},  # concept -> (verdict, hit_name_or_None, why)
+        "last_embedded": None,
+        "decompose_calls": 0,
+        # Cross-year comparison (scope.infer_years + multi-year retrieval).
+        "loaded_years": [2019, 2020, 2021, 2022, 2023],
+        "year_hits": {},
+        "searched_years": [],
     }
 
     async def fake_classify_followup(question, prior_q, prior_a, *, gateway, earlier=""):
@@ -89,6 +107,11 @@ def pipeline(monkeypatch):
         state["classifier_earlier"] = earlier
         state["classifier_calls"] += 1
         return state["followup_kind"]
+
+    async def fake_classify_citation_followup(question, prior_q, prior_a, *, gateway):
+        del question, prior_q, prior_a, gateway
+        state["citation_classifier_calls"] += 1
+        return state["citation_followup_kind"]
 
     async def fake_explain_compose(**kwargs):
         order.append("explain")
@@ -98,6 +121,11 @@ def pipeline(monkeypatch):
         order.append("guidance")
         state["guidance_kwargs"] = kwargs
         return "Use it as a descriptive point estimate; it has no standard error."
+
+    async def fake_cite_explain_compose(**kwargs):
+        order.append("cite_explain")
+        state["cite_explain_kwargs"] = kwargs
+        return "FDSCAT4_A is the one most researchers use."
 
     async def fake_run_db(operation, *args, **kwargs):
         if operation is relational_store.ensure_conversation:
@@ -112,10 +140,19 @@ def pipeline(monkeypatch):
             return state["prior"]
         if operation is vector_store.search_variables:
             order.append("retrieve")
-            state["searched_year"] = kwargs.get("survey_year")
+            year = kwargs.get("survey_year")
+            state["searched_year"] = year
+            state["searched_years"].append(year)
+            concept = state["last_embedded"]
+            if (concept, year) in state["year_hits"]:
+                return list(state["year_hits"][(concept, year)])
+            if state["compound"] and concept in state["concept_hits"]:
+                return list(state["concept_hits"][concept])
             return list(state["hits"])
         if operation is vector_store.survey_table_exists:
             return state["survey_table_exists"]
+        if operation is vector_store.loaded_survey_years:
+            return state["loaded_years"]
         if operation is vector_store.get_variable:
             name = args[1]
             state["fetched"].append(name)
@@ -140,15 +177,27 @@ def pipeline(monkeypatch):
         return state["intent"]
 
     async def fake_embed(question, embedder):
-        del question, embedder
+        del embedder
+        state["last_embedded"] = question
         return [0.0] * 768
 
+    def fake_looks_compound(question):
+        del question
+        return state["compound"]
+
+    async def fake_decompose(question, *, gateway):
+        del gateway
+        state["decompose_calls"] += 1
+        return state["concepts"] or [question]
+
     async def fake_judge(question, hits_arg, *, gateway):
-        del question, gateway
+        del gateway
         order.append("judge")
+        if question in state["concept_verdicts"]:
+            return state["concept_verdicts"][question]
         verdict = state["verdict"]
         closest = hits_arg[0] if hits_arg and verdict != "ABSENT" else None
-        return verdict, closest, "because"
+        return verdict, closest, "because", ([closest] if closest else [])
 
     async def fake_compose(question, hits_arg, verdict, *, gateway):
         del question, hits_arg, verdict, gateway
@@ -172,6 +221,10 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(followup, "classify", fake_classify_followup)
     monkeypatch.setattr(explain, "compose", fake_explain_compose)
     monkeypatch.setattr(guidance, "compose", fake_guidance_compose)
+    monkeypatch.setattr(citation_followup, "classify", fake_classify_citation_followup)
+    monkeypatch.setattr(cite_explain, "compose", fake_cite_explain_compose)
+    monkeypatch.setattr(decompose, "looks_compound", fake_looks_compound)
+    monkeypatch.setattr(decompose, "decompose", fake_decompose)
 
     return {"order": order, "state": state, "db_ops": db_ops}
 
@@ -636,6 +689,300 @@ async def test_classifier_is_not_called_when_the_last_answer_has_no_computation(
 async def test_classifier_is_not_called_on_the_first_message(pipeline):
     await run(pipeline, "How is food insecurity measured?")
     assert pipeline["state"]["classifier_calls"] == 0
+
+
+def citation_turn(state, verdict="MEASURED"):
+    """A prior turn that named a codebook variable, with no computed SQL."""
+    state["history"] = [
+        Message(role="user", content="Does NHIS measure loneliness or social isolation?"),
+        Message(
+            role="assistant",
+            content=(
+                "The closest NHIS item is RJWRKCLSSD_A, which asks how often a "
+                "worker had to stay within six feet of others during COVID-19 "
+                "social distancing. It captures workplace proximity, not "
+                "personal feelings of loneliness."
+            ),
+        ),
+    ]
+    state["prior"] = {
+        "id": 1,
+        "content": state["history"][-1].content,
+        "citations": [
+            {
+                "variable_name": "RJWRKCLSSD_A",
+                "section": "Social distancing at work",
+                "page": 576,
+                "survey_year": 2020,
+                "description": "Work close to others with social distancing in effect",
+                "question_text": None,
+            }
+        ],
+        "verdict": verdict,
+        "generated_sql": None,
+        "sql_verified": None,
+    }
+
+
+async def test_about_citations_is_answered_without_retrieval_or_the_judge(pipeline):
+    """The exact bug: 'which one is most used' was judged ABSENT instead of
+    being answered from the variables already named."""
+    state = pipeline["state"]
+    citation_turn(state)
+    state["citation_followup_kind"] = "about_citations"
+
+    events = await run(pipeline, "Which of those is the one most researchers use?")
+    order = pipeline["order"]
+    kinds = types_of(events)
+
+    assert "retrieve" not in order and "judge" not in order
+    assert "rewrite" not in order
+    assert "cite_explain" in order
+    # The verdict is echoed from the prior turn, never re-decided.
+    assert next(e for e in events if e["type"] == "verdict")["verdict"] == "MEASURED"
+    assert "most researchers use" in answer_of(events)
+    assert kinds[0] == "route" and kinds[-1] == "done"
+    assert len(state["logged"]) == 1 and state["logged"][0]["intent"] == "codebook"
+
+
+async def test_about_citations_is_grounded_in_the_specific_variable_already_named(pipeline):
+    """The exact bug: 'why doesn't that one count' drifted to a different,
+    merely similar variable (RJCLSSD1_A) than the one just named."""
+    state = pipeline["state"]
+    citation_turn(state, verdict="RELATED")
+    state["citation_followup_kind"] = "about_citations"
+    state["fetchable"] = {"RJWRKCLSSD_A": make_hit("RJWRKCLSSD_A", page=576)}
+
+    events = await run(pipeline, "Why doesn't that one count as measuring it?")
+
+    assert pipeline["order"].count("cite_explain") == 1
+    # The composer was given exactly the previously-cited variable to work
+    # from — never a fresh retrieval result that could resolve to something
+    # else with a similar name.
+    variables = state["cite_explain_kwargs"]["variables"]
+    assert [v.variable_name for v in variables] == ["RJWRKCLSSD_A"]
+    assert state["fetched"] == ["RJWRKCLSSD_A"]
+
+
+async def test_a_metadata_question_about_citations_skips_the_llm_entirely(pipeline):
+    state = pipeline["state"]
+    citation_turn(state)
+    state["citation_followup_kind"] = "about_citations"
+
+    events = await run(pipeline, "What page is that on?")
+    assert "cite_explain" not in pipeline["order"]
+    # No re-fetch either: the answer comes straight from the citation record.
+    assert state["fetched"] == []
+    assert "576" in answer_of(events)
+
+
+async def test_a_new_concept_after_a_citation_answer_takes_the_normal_pipeline(pipeline):
+    state = pipeline["state"]
+    citation_turn(state)
+    state["citation_followup_kind"] = "new"
+
+    await run(pipeline, "How is poverty measured?")
+    assert state["citation_classifier_calls"] == 1
+    order = pipeline["order"]
+    assert "retrieve" in order
+    assert "cite_explain" not in order
+
+
+async def test_citation_classifier_is_not_called_after_a_computed_statistic(pipeline):
+    """A prior turn with SQL uses the stats classifier, never this one."""
+    state = pipeline["state"]
+    computed_turn(state)
+    state["followup_kind"] = "new"
+
+    await run(pipeline, "What about 2021?")
+    assert state["citation_classifier_calls"] == 0
+
+
+async def test_citation_classifier_is_not_called_when_there_is_no_prior_turn(pipeline):
+    await run(pipeline, "How is food insecurity measured?")
+    assert pipeline["state"]["citation_classifier_calls"] == 0
+
+
+def make_decomposition_fixture_hit(name: str, similarity: float, description: str) -> Hit:
+    return Hit(
+        variable_name=name, survey_year=2021, page=1, similarity=similarity,
+        description=description,
+    )
+
+
+# K6SPD_A at 0.41 similarity for the full compound sentence, 0.61 for the
+# concept alone — the real numbers measured against the live corpus.
+K6SPD_A_DILUTED = make_decomposition_fixture_hit("K6SPD_A", 0.41, "Serious psychological distress")
+K6SPD_A_CLEAN = make_decomposition_fixture_hit("K6SPD_A", 0.61, "Serious psychological distress")
+DISTRACTOR_1 = make_decomposition_fixture_hit("FAMCARECVD_A", 0.53, "Caregiving during COVID")
+DISTRACTOR_2 = make_decomposition_fixture_hit("RJCLSSD1_A", 0.52, "Social distancing at work")
+
+
+async def test_a_compound_question_is_decomposed_and_retrieved_per_concept(pipeline):
+    """Reproduces the professor's exact question: 'serious psychological
+    distress' buried in a compound sentence ranked K6SPD_A outside the top
+    10; decomposed and retrieved alone it ranks first."""
+    state = pipeline["state"]
+    state["compound"] = True
+    state["concepts"] = ["serious psychological distress", "race (Black vs White)"]
+    # The pooled, non-decomposed retrieval a flat embedding would have
+    # returned — K6SPD_A diluted below two distractors.
+    state["hits"] = [DISTRACTOR_1, DISTRACTOR_2, K6SPD_A_DILUTED]
+    state["concept_hits"] = {
+        "serious psychological distress": [K6SPD_A_CLEAN],
+        "race (Black vs White)": [DISTRACTOR_1],
+    }
+    state["concept_verdicts"] = {
+        "serious psychological distress": (
+            "MEASURED", K6SPD_A_CLEAN, "because", [K6SPD_A_CLEAN],
+        ),
+        "race (Black vs White)": ("MEASURED", DISTRACTOR_1, "because", [DISTRACTOR_1]),
+    }
+    state["intent"] = "data"
+
+    events = await run(
+        pipeline,
+        "I want to know whether rates of serious psychological distress "
+        "differ between blacks and whites.",
+    )
+
+    assert state["decompose_calls"] == 1
+    # The judge ran once per concept, against that concept's OWN candidates —
+    # never the pooled, diluted set.
+    assert pipeline["order"].count("judge") == 2
+    assert next(e for e in events if e["type"] == "verdict")["verdict"] == "MEASURED"
+    citations = next(e for e in events if e["type"] == "citations")["citations"]
+    # K6SPD_A has a guaranteed slot: it is the concept's own best match, not
+    # out-competed by distractors from an unrelated concept in the same hits
+    # pool, which is exactly what happened before this fix.
+    assert "K6SPD_A" in {c["variable_name"] for c in citations}
+
+
+async def test_absent_requires_every_concept_to_be_absent(pipeline):
+    """The exact false claim: naming the K6 scale and declaring it unmeasured
+    when at least one concept genuinely has no NHIS variable must not drag a
+    question with a real answer down to a blanket refusal — and the reverse
+    must also hold: ABSENT only when nothing, anywhere, was measured."""
+    state = pipeline["state"]
+    state["compound"] = True
+    state["concepts"] = ["concept A", "concept B"]
+    state["concept_hits"] = {"concept A": [], "concept B": []}
+    state["concept_verdicts"] = {
+        "concept A": ("ABSENT", None, "No variable records this.", []),
+        "concept B": ("ABSENT", None, "Nothing in the codebook addresses this.", []),
+    }
+    state["hits"] = []
+
+    events = await run(pipeline, "A question about two genuinely unmeasured things.")
+    assert next(e for e in events if e["type"] == "verdict")["verdict"] == "ABSENT"
+    answer = answer_of(events)
+    # Both concepts' reasons are present, not just one of them silently
+    # dropped.
+    assert "No variable records this." in answer
+    assert "Nothing in the codebook addresses this." in answer
+
+
+async def test_one_measured_concept_outweighs_an_absent_one(pipeline):
+    state = pipeline["state"]
+    state["compound"] = True
+    state["concepts"] = ["measured concept", "absent concept"]
+    hit = make_decomposition_fixture_hit("REAL_VAR_A", 0.6, "A real variable")
+    state["concept_hits"] = {"measured concept": [hit], "absent concept": []}
+    state["concept_verdicts"] = {
+        "measured concept": ("MEASURED", hit, "because", [hit]),
+        "absent concept": ("ABSENT", None, "not measured", []),
+    }
+    state["hits"] = [hit]
+    state["intent"] = "codebook"
+
+    events = await run(pipeline, "A question bundling one real thing and one absent thing.")
+    assert next(e for e in events if e["type"] == "verdict")["verdict"] == "MEASURED"
+
+
+async def test_a_simple_question_never_calls_decompose(pipeline):
+    """The common case must cost nothing extra — decompose() is never even
+    called when the question does not look compound."""
+    await run(pipeline, "How is food insecurity measured?")
+    assert pipeline["state"]["decompose_calls"] == 0
+
+
+def _year_hit(name: str, year: int, similarity: float = 0.6) -> Hit:
+    return Hit(variable_name=name, survey_year=year, page=1, similarity=similarity)
+
+
+async def test_a_two_year_comparison_retrieves_against_both_years(pipeline):
+    """K6SPD_A only exists in 2021; a question comparing 2021 to 2023 must
+    search 2021 too, not just the single year scope.resolve_year() would
+    otherwise pick."""
+    state = pipeline["state"]
+    k6_2021 = _year_hit("K6SPD_A", 2021)
+    age_2023 = _year_hit("AGEP_A", 2023)
+    state["year_hits"] = {
+        ("compare psychological distress between 2021 and 2023", 2021): [k6_2021],
+        ("compare psychological distress between 2021 and 2023", 2023): [age_2023],
+    }
+    state["intent"] = "codebook"
+
+    await run(pipeline, "compare psychological distress between 2021 and 2023")
+
+    assert 2021 in pipeline["state"]["searched_years"]
+    assert 2023 in pipeline["state"]["searched_years"]
+
+
+async def test_years_outside_the_loaded_range_produce_a_coverage_note(pipeline):
+    """2017-2018 use the pre-redesign questionnaire (not loaded); 2024-2025
+    have not been released by NHIS. Both must be named, not silently
+    dropped, and distinguished from each other."""
+    state = pipeline["state"]
+    state["intent"] = "data"
+    state["survey_table_exists"] = True
+    state["generated_sql"] = "SELECT 1"
+    state["sql_result"] = readonly_store.SqlResult(columns=["x"], rows=[[1]])
+
+    events = await run(
+        pipeline, "compare rates in 2017-2019 against 2023-2025 accounting for X"
+    )
+    answer = answer_of(events)
+    assert "2017, 2018" in answer
+    assert "pre-2019 questionnaire" in answer
+    assert "2024, 2025" in answer
+    assert "not been surveyed or released" in answer
+
+
+async def test_a_two_year_statistics_question_runs_the_stats_path_per_year(pipeline):
+    state = pipeline["state"]
+    state["intent"] = "data"
+    state["survey_table_exists"] = True
+    state["generated_sql"] = "SELECT 1"
+    state["sql_result"] = readonly_store.SqlResult(columns=["x"], rows=[[1]])
+
+    events = await run(pipeline, "compare the figure in 2019 against 2023")
+    answer = answer_of(events)
+
+    assert "**2019**" in answer
+    assert "**2023**" in answer
+    # sql_gen ran once per year via the ordinary verified-statistics path,
+    # not once for a query that tried to span two years at once.
+    assert pipeline["order"].count("sql_gen") == 2
+    assert "statistical software" in answer
+
+
+async def test_when_no_requested_year_is_loaded_the_single_year_default_is_used(pipeline):
+    """A comparison entirely outside the loaded range (e.g. 1990 vs 1995)
+    must still get an answer, not silently produce nothing."""
+    state = pipeline["state"]
+    state["intent"] = "codebook"
+
+    await run(pipeline, "compare rates between 1990 and 1995", survey_year=None)
+    # Falls back to the single resolved year, exactly like an ordinary
+    # question with no year named at all.
+    assert pipeline["state"]["searched_years"] == [None]
+
+
+async def test_a_single_year_question_is_unaffected_by_multi_year_logic(pipeline):
+    """The common case: one search, exactly as before this feature existed."""
+    await run(pipeline, "How is food insecurity measured in 2021?")
+    assert pipeline["state"]["searched_years"] == [2021]
 
 
 async def test_usage_limit_is_reported_as_such_with_the_wait(pipeline, monkeypatch):

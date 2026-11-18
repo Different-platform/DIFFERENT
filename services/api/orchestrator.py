@@ -27,9 +27,12 @@ from collections.abc import AsyncIterator
 from uuid import UUID
 
 from services.api import events
-from services.api.domain import Citation, Hit, RouteIntent, Verdict
+from services.api.domain import SURVEY_YEARS_MAX, Citation, Hit, RouteIntent, Verdict
 from services.api.llm.gateway import LLMGateway, LLMGatewayError, LLMRateLimitError
 from services.api.rag import (
+    cite_explain,
+    citation_followup,
+    decompose,
     derivations,
     explain,
     followup,
@@ -55,6 +58,12 @@ RETRIEVAL_LIMIT = 8
 #: as BMI needs every input variable (height AND weight) to be retrieved, and a
 #: lower-ranked input silently turns "computable" into "not measured".
 RETRIEVAL_LIMIT_DATA = 10
+
+#: Per-concept limit once a question has been decomposed into more than one
+#: concept. Lower than RETRIEVAL_LIMIT/RETRIEVAL_LIMIT_DATA on purpose: each
+#: concept gets its own clean search rather than competing for a shared pool,
+#: so it does not need as many candidates to surface its own best match.
+RETRIEVAL_LIMIT_PER_CONCEPT = 6
 
 #: Extra attempts to repair SQL the verifier rejected. The repaired query must
 #: still pass the verifier; this only buys a second chance at a valid one.
@@ -114,59 +123,82 @@ class Orchestrator:
                 content=question,
             )
 
-            # --- "explain that" / "how do I use this": answer from the
-            # computation that ran ---
+            # --- a follow-up about the previous answer: answer from what was
+            # already said, not from a fresh search ---
             # A request about the previous answer must not go back through
-            # retrieval and the judge, which never saw that computation and
-            # can contradict it, nor re-run the query and repeat the number.
-            # Only considered when the last turn was a computed, verified
-            # statistic.
+            # retrieval and the judge, which never saw that answer and can
+            # contradict it, nor re-run a query and repeat the number. Two
+            # shapes of prior answer get this treatment, each with its own
+            # classifier because the examples that distinguish "about this"
+            # from "a new question" differ between them:
+            #   - a computed, verified statistic (rag/followup.py)
+            #   - a codebook citation with no SQL (rag/citation_followup.py)
             prior = (
                 await db.run_db(relational_store.load_last_assistant, conversation_uuid)
                 if history
                 else None
             )
-            if prior and prior.get("generated_sql") and prior.get("sql_verified"):
+            if prior:
                 prior_question = next(
                     (m.content for m in reversed(history) if m.role == "user"), ""
                 )
-                # Earlier answers let "why did it go up from 2022 to 2023?" be
-                # recognised as a question about figures already shown.
-                earlier = " | ".join(
-                    m.content[:200]
-                    for m in history[:-1][-guidance.EARLIER_MESSAGES:]
-                    if m.role == "assistant"
-                )
-                kind = await followup.classify(
-                    question,
-                    prior_question,
-                    prior["content"],
-                    gateway=self.gateway,
-                    earlier=earlier,
-                )
-                if kind == "explain":
-                    async for event in self._explain_previous(
+                if prior.get("generated_sql") and prior.get("sql_verified"):
+                    # Earlier answers let "why did it go up from 2022 to
+                    # 2023?" be recognised as a question about figures
+                    # already shown.
+                    earlier = " | ".join(
+                        m.content[:200]
+                        for m in history[:-1][-guidance.EARLIER_MESSAGES:]
+                        if m.role == "assistant"
+                    )
+                    kind = await followup.classify(
                         question,
-                        prior,
                         prior_question,
-                        conversation_uuid,
-                        started,
-                        sql_state,
-                    ):
-                        yield event
-                    return
-                if kind == "guidance":
-                    async for event in self._guide_previous(
+                        prior["content"],
+                        gateway=self.gateway,
+                        earlier=earlier,
+                    )
+                    if kind == "explain":
+                        async for event in self._explain_previous(
+                            question,
+                            prior,
+                            prior_question,
+                            conversation_uuid,
+                            started,
+                            sql_state,
+                        ):
+                            yield event
+                        return
+                    if kind == "guidance":
+                        async for event in self._guide_previous(
+                            question,
+                            prior,
+                            prior_question,
+                            conversation_uuid,
+                            started,
+                            sql_state,
+                            history,
+                        ):
+                            yield event
+                        return
+                elif prior.get("citations"):
+                    kind = await citation_followup.classify(
                         question,
-                        prior,
                         prior_question,
-                        conversation_uuid,
-                        started,
-                        sql_state,
-                        history,
-                    ):
-                        yield event
-                    return
+                        prior["content"],
+                        gateway=self.gateway,
+                    )
+                    if kind == "about_citations":
+                        async for event in self._explain_citations(
+                            question,
+                            prior,
+                            prior_question,
+                            conversation_uuid,
+                            started,
+                            sql_state,
+                        ):
+                            yield event
+                        return
 
             # --- stage 1: rewrite follow-ups into a standalone question ---
             standalone = await rewrite.to_standalone(
@@ -185,18 +217,67 @@ class Orchestrator:
             )
 
             # --- stage 3: retrieve ---
-            vector = await retrieval.embed_question(standalone, self.embedder)
-            hits = await db.run_db(
-                vector_store.search_variables,
-                vector,
-                survey_year=survey_year,
-                limit=(
-                    RETRIEVAL_LIMIT_DATA
-                    if intent in ("data", "both")
-                    else RETRIEVAL_LIMIT
-                ),
+            # A compound question ("...rates of X between blacks and whites
+            # ... accounting for education, marital status, and insurance
+            # type") embeds as one blurred vector that matches no single
+            # concept well. "Serious psychological distress" asked alone
+            # ranks K6SPD_A #1; buried in that sentence it falls out of the
+            # top 10 entirely. Decomposing into separate concepts and
+            # retrieving each on its own is what keeps that from happening.
+            # `looks_compound` gates the extra LLM call, so a normal
+            # single-concept question pays nothing extra and this reduces to
+            # exactly the single-embedding behavior below.
+            concepts = [standalone]
+            if decompose.looks_compound(standalone):
+                concepts = await decompose.decompose(standalone, gateway=self.gateway)
+
+            # A question comparing two periods ("2017-2019" vs "2023-2025")
+            # needs retrieval against every year actually relevant, not the
+            # one year scope.resolve_year() picks for an ordinary question.
+            # Without this, K6SPD_A (asked only in 2021) is invisible to a
+            # question scoped to 2023 by default, regardless of how well it
+            # matches the concept — the year filter excludes it before
+            # similarity is even considered.
+            requested_years = scope.infer_years(standalone)
+            search_years: list[int | None] = [survey_year]
+            missing_years: list[int] = []
+            if len(requested_years) >= 2:
+                loaded_years = await db.run_db(vector_store.loaded_survey_years)
+                usable_years = sorted(set(requested_years) & set(loaded_years))
+                if usable_years:
+                    search_years = usable_years
+                    missing_years = sorted(set(requested_years) - set(loaded_years))
+
+            per_concept_limit = (
+                RETRIEVAL_LIMIT_DATA if intent in ("data", "both") else RETRIEVAL_LIMIT
             )
-            hits = retrieval.dedupe_by_variable(hits)
+            if len(concepts) > 1:
+                per_concept_limit = RETRIEVAL_LIMIT_PER_CONCEPT
+
+            hits_by_concept: dict[str, list[Hit]] = {}
+            for concept in concepts:
+                vector = await retrieval.embed_question(concept, self.embedder)
+                concept_hits: list[Hit] = []
+                for year in search_years:
+                    concept_hits.extend(
+                        await db.run_db(
+                            vector_store.search_variables,
+                            vector,
+                            survey_year=year,
+                            limit=per_concept_limit,
+                        )
+                    )
+                hits_by_concept[concept] = concept_hits
+
+            # Across more than one year, two hits for the same variable are
+            # a real fact worth keeping (available in one year, not the
+            # other) rather than noise to collapse.
+            dedupe = (
+                retrieval.dedupe_by_variable_and_year
+                if len(search_years) > 1
+                else retrieval.dedupe_by_variable
+            )
+            hits = dedupe([hit for group in hits_by_concept.values() for hit in group])
             if intent in ("data", "both") and survey_year is not None:
                 hits = await self._with_derivation_inputs(
                     standalone, hits, survey_year
@@ -215,14 +296,33 @@ class Orchestrator:
                 else []
             )
             by_name = {hit.variable_name: hit for hit in hits}
+            concept_verdicts: (
+                dict[str, tuple[Verdict, Hit | None, str, list[Hit]]] | None
+            ) = None
+            best_hits: list[Hit] = []
             if inputs and all(name in by_name for name in inputs):
                 verdict = "MEASURED"
                 closest = by_name[inputs[0]]
                 why = "Derived from " + " and ".join(inputs) + "."
-            else:
-                verdict, closest, why = await judge.classify_presence(
+                best_hits = [closest]
+            elif len(concepts) == 1:
+                verdict, closest, why, best_hits = await judge.classify_presence(
                     standalone, hits, gateway=self.gateway
                 )
+            else:
+                # Judge each concept against its OWN retrieved candidates,
+                # never the pooled set — the entire point is that a judge
+                # given all 5-6 concepts' candidates at once sees the same
+                # diluted pool retrieval just escaped.
+                concept_verdicts = {
+                    concept: await judge.classify_presence(
+                        concept, hits_by_concept[concept], gateway=self.gateway
+                    )
+                    for concept in concepts
+                }
+                verdict = _aggregate_verdict(concept_verdicts)
+                closest = _primary_closest(concept_verdicts)
+                why = _combine_why(concept_verdicts)
             yield events.verdict(verdict)
 
             # --- stage 5: answer, branching on verdict then intent ---
@@ -248,16 +348,42 @@ class Orchestrator:
                     yield events.token(chunk)
 
             else:  # MEASURED
-                citations = generate.citations_from_hits(hits)
+                # A flat top-3-by-similarity pool is how VIRAPP12M_A (the
+                # right answer to "does NHIS measure telehealth use") lost
+                # its citation slot to three merely co-retrieved variables
+                # that only out-ranked it on raw retrieval similarity, which
+                # measures topical closeness, not correctness. `best_hits`
+                # is the judge's own answer to which candidate actually
+                # answers the question, so it is cited instead. When the
+                # question was decomposed, each concept that came back
+                # MEASURED/RELATED gets its own guaranteed slot the same way.
+                citations = (
+                    _citations_from_concept_verdicts(concept_verdicts, hits)
+                    if concept_verdicts
+                    else (
+                        [hit.to_citation() for hit in best_hits]
+                        if best_hits
+                        else generate.citations_from_hits(hits)
+                    )
+                )
                 yield events.citations(citations)
 
                 if intent in ("data", "both"):
-                    async for event, chunk in self._verified_statistics(
-                        standalone, hits, survey_year, sql_state, year_assumed
-                    ):
-                        if chunk is not None:
-                            answer_parts.append(chunk)
-                        yield event
+                    stats_years = [y for y in search_years if y is not None]
+                    if len(stats_years) > 1:
+                        async for event, chunk in self._verified_statistics_per_year(
+                            standalone, hits, stats_years, missing_years, sql_state
+                        ):
+                            if chunk is not None:
+                                answer_parts.append(chunk)
+                            yield event
+                    else:
+                        async for event, chunk in self._verified_statistics(
+                            standalone, hits, survey_year, sql_state, year_assumed
+                        ):
+                            if chunk is not None:
+                                answer_parts.append(chunk)
+                            yield event
                     # Persist the variables the query actually used, not just
                     # the top retrieval hits.
                     citations = sql_state.get("citations") or citations
@@ -385,6 +511,78 @@ class Orchestrator:
         )
         yield events.done(message_id)
 
+    async def _explain_citations(
+        self,
+        question: str,
+        prior: dict,
+        prior_question: str,
+        conversation_uuid,
+        started: float,
+        sql_state: dict,
+    ) -> AsyncIterator[dict]:
+        """Answer a follow-up about variables already cited in a codebook
+        answer ("which one is better", "why doesn't that one count", "what
+        page is that on").
+
+        No retrieval, no judge: the only variables this can ever discuss are
+        the ones already cited, fetched again only for their full codebook
+        detail (universe, value labels) rather than re-searched. That is what
+        makes it structurally impossible to drift to a different, merely
+        similar variable than the one the researcher is actually asking
+        about.
+        """
+        verdict = prior.get("verdict") or "MEASURED"
+        citations = _citations_of(prior)
+
+        yield events.route("codebook")
+        yield events.verdict(verdict)
+        if citations:
+            yield events.citations(citations)
+
+        # Pure metadata (page/year/section) is answered straight from the
+        # citation record, with no DB re-fetch and no LLM call at all.
+        text = cite_explain.metadata_answer(citations, question)
+        if text is None:
+            variables = await self._variables_of_citations(citations)
+            text = await cite_explain.compose(
+                question=question,
+                prior_question=prior_question,
+                prior_answer=prior["content"],
+                variables=variables,
+                gateway=self.gateway,
+            )
+        for chunk in _chunk(text):
+            yield events.token(chunk)
+
+        message_id = await self._save_followup(
+            text, prior, citations, verdict, conversation_uuid
+        )
+        sql_state.update(sql=None, verified=None, notes=None)
+        await self._log(
+            question=question,
+            standalone=question,
+            conversation_uuid=conversation_uuid,
+            message_id=message_id,
+            intent="codebook",
+            verdict=verdict,
+            hits=[],
+            started=started,
+            sql_state=sql_state,
+        )
+        yield events.done(message_id)
+
+    async def _variables_of_citations(self, citations: list[Citation]) -> list[Hit]:
+        """Full codebook detail for variables already cited, re-fetched by
+        name/year rather than re-retrieved by meaning."""
+        variables: list[Hit] = []
+        for citation in citations:
+            found = await db.run_db(
+                vector_store.get_variable, citation.survey_year, citation.variable_name
+            )
+            if found is not None:
+                variables.append(found)
+        return variables
+
     async def _guide_previous(
         self,
         question: str,
@@ -465,8 +663,11 @@ class Orchestrator:
     ) -> int:
         """Save a reply about the previous answer.
 
-        The SQL is carried forward so a further "explain more" or "how do I
-        use this" still has the computation to talk about.
+        The SQL (if any) is carried forward so a further "explain more" or
+        "how do I use this" still has the computation to talk about.
+        `sql_verified` is taken from `prior` rather than hardcoded: a
+        citation-only prior has no SQL, and claiming one was verified here
+        would be false.
         """
         return await db.run_db(
             relational_store.insert_message,
@@ -476,7 +677,7 @@ class Orchestrator:
             citations=citations or None,
             verdict=verdict,
             generated_sql=prior["generated_sql"],
-            sql_verified=True,
+            sql_verified=prior.get("sql_verified"),
         )
 
     async def _with_derivation_inputs(
@@ -617,6 +818,54 @@ class Orchestrator:
         for chunk in _chunk(text):
             yield events.token(chunk), chunk
 
+    async def _verified_statistics_per_year(
+        self,
+        question: str,
+        hits: list[Hit],
+        years: list[int],
+        missing_years: list[int],
+        sql_state: dict,
+    ) -> AsyncIterator[tuple[dict, str | None]]:
+        """A comparison across years, run as the existing single-year
+        verified-statistics path once per year, never as one query spanning
+        years it cannot verify at once.
+
+        This answers "how does X compare between 2019 and 2023" with each
+        year's own verified figure, plainly labelled, and an explicit
+        statement that no test of whether the difference is real rather than
+        chance is computed — that needs survey-design-aware software this
+        tool does not have. It does not attempt the covariate-adjusted or
+        causal comparison a full research question may also be asking for;
+        that remains out of scope regardless of which years are available.
+        """
+        for index, year in enumerate(years):
+            heading = f"**{year}**\n" if index == 0 else f"\n\n**{year}**\n"
+            yield events.token(heading), heading
+
+            year_hits = [hit for hit in hits if hit.survey_year == year] or hits
+            per_year_state: dict = {"sql": None, "verified": None, "notes": None}
+            async for event, chunk in self._verified_statistics(
+                question, year_hits, year, per_year_state, year_assumed=False
+            ):
+                if chunk is not None:
+                    chunk = f"{chunk}"
+                yield event, chunk
+            # The last year run is what query_log records; recording every
+            # year's SQL would need a schema change this does not make.
+            sql_state.update(per_year_state)
+
+        closing: list[str] = []
+        if missing_years:
+            closing.append(_year_coverage_note(missing_years))
+        closing.append(
+            "This does not include a test of whether the difference between "
+            "years is larger than would happen by chance; that needs "
+            "survey-design-aware statistical software, not this tool."
+        )
+        text = "\n\n" + " ".join(closing)
+        for chunk in _chunk(text):
+            yield events.token(chunk), chunk
+
     async def _log(
         self,
         *,
@@ -704,6 +953,110 @@ def _retrieved_summary(hits: list[Hit]) -> list[dict]:
         }
         for hit in hits
     ]
+
+
+#: (verdict, closest, why, best_hits) — classify_presence's full return
+#: shape, one entry per decomposed concept.
+ConceptVerdict = tuple[Verdict, "Hit | None", str, "list[Hit]"]
+
+
+def _aggregate_verdict(concept_verdicts: dict[str, ConceptVerdict]) -> Verdict:
+    """ABSENT only if every concept came back ABSENT.
+
+    A compound question is answerable in part whenever any one of its
+    concepts is measured — "is race measured? is insurance type measured?
+    is psychological distress measured?" each has its own true answer, and
+    the question should report what IS there rather than let one absent
+    concept (or one that was never asked, if the researcher's sentence
+    bundles five ideas) drag the whole thing down to a blanket refusal.
+    """
+    verdicts = [v for v, _, _, _ in concept_verdicts.values()]
+    if any(v == "MEASURED" for v in verdicts):
+        return "MEASURED"
+    if any(v == "RELATED" for v in verdicts):
+        return "RELATED"
+    return "ABSENT"
+
+
+def _primary_closest(concept_verdicts: dict[str, ConceptVerdict]) -> Hit | None:
+    """The best non-ABSENT match, for the RELATED branch's single citation.
+
+    Property 3 requires RELATED to carry exactly one citation regardless of
+    how many concepts were judged, so this picks one rather than letting the
+    multi-concept case grow that list.
+    """
+    candidates = [c for v, c, _, _ in concept_verdicts.values() if v != "ABSENT" and c]
+    return max(candidates, key=lambda hit: hit.similarity, default=None)
+
+
+def _combine_why(concept_verdicts: dict[str, ConceptVerdict]) -> str:
+    """A short combined rationale, for the ABSENT message when every concept
+    was absent. Joins rather than picking one, so a question naming several
+    genuinely unmeasured concepts doesn't look like only one was checked."""
+    reasons = [why for _, _, why, _ in concept_verdicts.values() if why]
+    return " ".join(dict.fromkeys(reasons))  # de-duplicated, order preserved
+
+
+def _citations_from_concept_verdicts(
+    concept_verdicts: dict[str, ConceptVerdict],
+    hits: list[Hit],
+) -> list[Citation]:
+    """One citation per concept that came back MEASURED or RELATED, each the
+    judge's own best match for that concept — never a pool shared across all
+    of them, and never the raw retrieval-similarity ranking, which is what
+    let a different concept's higher-scored candidates crowd out the right
+    variable for this one.
+
+    Falls back to the ordinary top-similarity selection if every concept
+    somehow had no judge-selected match, so this never yields nothing when
+    `hits` is non-empty.
+    """
+    seen: set[str] = set()
+    citations: list[Citation] = []
+    for verdict, closest, _, _ in concept_verdicts.values():
+        if verdict == "ABSENT" or closest is None or closest.variable_name in seen:
+            continue
+        seen.add(closest.variable_name)
+        citations.append(closest.to_citation())
+    return citations or generate.citations_from_hits(hits)
+
+
+#: The year NHIS redesigned its questionnaire. Distinct from
+#: SURVEY_YEARS_MIN (2017, the full historical range in theory): 2017-2018
+#: exist as real NHIS years but use the pre-redesign format and are not
+#: loaded by this version's parser, which only reads 2019 and later.
+_REDESIGN_YEAR = 2019
+
+
+def _year_coverage_note(missing_years: list[int]) -> str:
+    """A plain statement of which requested years are not available, and
+    why, rather than silently answering as if they were never asked about.
+
+    Two distinct reasons are worth naming separately: years before the
+    loaded range use a different, pre-redesign questionnaire NHIS has not
+    been parsed for yet; years after it have not been surveyed or released
+    by NHIS at all. Conflating the two ("not available") would make 2025
+    sound like a data-loading gap rather than a year that does not exist.
+    """
+    pre = sorted(y for y in missing_years if y < _REDESIGN_YEAR)
+    post = sorted(y for y in missing_years if y > SURVEY_YEARS_MAX)
+    other = sorted(y for y in missing_years if _REDESIGN_YEAR <= y <= SURVEY_YEARS_MAX)
+
+    parts: list[str] = []
+    if pre:
+        parts.append(
+            f"{_list_years(pre)} use NHIS's pre-2019 questionnaire, which is "
+            f"not loaded in this version"
+        )
+    if post:
+        parts.append(f"{_list_years(post)} have not been surveyed or released by NHIS yet")
+    if other:
+        parts.append(f"{_list_years(other)} are not loaded in this version")
+    return "Note: " + "; ".join(parts) + "." if parts else ""
+
+
+def _list_years(years: list[int]) -> str:
+    return ", ".join(str(y) for y in years)
 
 
 def _citations_of(prior: dict) -> list[Citation]:
