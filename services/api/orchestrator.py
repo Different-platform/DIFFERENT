@@ -256,8 +256,11 @@ class Orchestrator:
 
             hits_by_concept: dict[str, list[Hit]] = {}
             for concept in concepts:
+                _retrieval_started = time.monotonic()
                 vector = await retrieval.embed_question(concept, self.embedder)
+                _embed_ms = int((time.monotonic() - _retrieval_started) * 1000)
                 concept_hits: list[Hit] = []
+                _db_started = time.monotonic()
                 for year in search_years:
                     concept_hits.extend(
                         await db.run_db(
@@ -267,6 +270,11 @@ class Orchestrator:
                             limit=per_concept_limit,
                         )
                     )
+                _db_ms = int((time.monotonic() - _db_started) * 1000)
+                logger.info(
+                    "retrieval concept=%r embed=%dms db_search=%dms (years=%s)",
+                    concept, _embed_ms, _db_ms, search_years,
+                )
                 hits_by_concept[concept] = concept_hits
 
             # Across more than one year, two hits for the same variable are
