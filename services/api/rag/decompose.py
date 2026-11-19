@@ -80,7 +80,15 @@ Respond with JSON only: {"concepts": ["concept one", "concept two", ...]}\
 #: multiple ideas; "What is the average BMI in 2023?" has neither.
 _COMPOUND_CUE = re.compile(
     r"\b(?:whether|accounting for|as opposed to|compared? (?:to|with)|"
-    r"differences? between|controlling for|adjust(?:ed|ing) for|and whether)\b",
+    r"differences? between|controlling for|adjust(?:ed|ing) for|and whether|"
+    # A follow-up that keeps an existing measure but adds a breakdown or
+    # subgroup filter ("broken down by age group", "below the poverty
+    # line") is two concepts (the measure, and the new dimension) even
+    # though it is short and has none of the connective words above —
+    # rewrite.to_standalone() produces exactly this shape for "break it
+    # down by X" and "what about for Y" follow-ups.
+    r"broken?\s+down\s+by|"
+    r"(?:below|above|under|over)\s+the\s+\w+\s+(?:line|threshold|level))\b",
     re.IGNORECASE,
 )
 
@@ -100,6 +108,58 @@ def looks_compound(question: str) -> bool:
     """
     text = question or ""
     return len(text.split()) > _LONG_QUESTION_WORDS or bool(_COMPOUND_CUE.search(text))
+
+
+#: "Does NHIS ask about sleep duration?" fails to retrieve SLPHOURS_A at all
+#: (best candidate similarity 0.467, wrong variable) even though it is a
+#: single, non-compound concept — looks_compound() correctly leaves it alone,
+#: because splitting it into "concepts" would be wrong. The actual problem is
+#: that the bare phrase "sleep duration" alone ranks SLPHOURS_A #1 at 0.593:
+#: the question-template wording itself, not any second concept, is what
+#: dilutes the embedding. This is a *different* failure from the compound
+#: one decompose() fixes, so it gets its own cheap, deterministic extractor
+#: rather than being folded into looks_compound()/decompose().
+_MEASURE_WRAPPER_PREFIX = re.compile(
+    r"^(?:does|did|do)\s+(?:the\s+)?nhis\s+"
+    r"(?:ask(?:\s+about)?|measure|track|include(?:\s+a\s+question\s+about)?|"
+    r"capture|record|have\s+(?:a\s+)?(?:question|variable|data)\s+(?:about|on|for))\s+"
+    r"(?:a\s+|an\s+|the\s+)?(.+?)\s*\??$",
+    re.IGNORECASE,
+)
+_MEASURE_WRAPPER_SUFFIX = re.compile(
+    r"^is\s+(?:there\s+a\s+variable\s+for\s+)?(?:a\s+|an\s+|the\s+)?(.+?)\s+"
+    r"(?:measured|tracked|captured|recorded|asked\s+about)\s+"
+    r"(?:in|by)\s+(?:the\s+)?nhis\s*\??$",
+    re.IGNORECASE,
+)
+_MEASURE_WRAPPER_VARIABLE_FOR = re.compile(
+    r"^is\s+there\s+a\s+variable\s+for\s+(?:a\s+|an\s+|the\s+)?(.+?)\s+"
+    r"(?:in|within|on)\s+(?:the\s+)?nhis\s*\??$",
+    re.IGNORECASE,
+)
+
+
+def extract_bare_concept(question: str) -> str | None:
+    """The topic alone, stripped of a "does/is NHIS measure/ask/track" shell.
+
+    Returns None when `question` does not match one of these templates, so
+    the caller can treat that as "nothing extra to retrieve on" rather than
+    a second, different concept. Used as an additional retrieval pass
+    alongside the question as asked — not a replacement for it, since the
+    full question is still what the judge and the final answer are about.
+    """
+    text = (question or "").strip()
+    for pattern in (
+        _MEASURE_WRAPPER_PREFIX,
+        _MEASURE_WRAPPER_SUFFIX,
+        _MEASURE_WRAPPER_VARIABLE_FOR,
+    ):
+        match = pattern.match(text)
+        if match:
+            bare = match.group(1).strip().rstrip("?").strip()
+            if bare and bare.lower() != text.lower():
+                return bare
+    return None
 
 
 def _parse(raw: str, fallback: str) -> list[str]:

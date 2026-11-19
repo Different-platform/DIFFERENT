@@ -231,6 +231,20 @@ class Orchestrator:
             if decompose.looks_compound(standalone):
                 concepts = await decompose.decompose(standalone, gateway=self.gateway)
 
+            # A "does/is NHIS measure/ask/track X" question is one concept,
+            # not compound, but the template wording itself dilutes the
+            # embedding badly enough to miss the real variable entirely
+            # ("Does NHIS ask about sleep duration?" misses SLPHOURS_A
+            # outright; the bare phrase "sleep duration" ranks it #1). Add
+            # the stripped phrase as an extra retrieval pass — the existing
+            # per-concept merge/judge/dedupe logic below already treats
+            # "measured by any concept" as measured, so this costs one more
+            # retrieval (no extra LLM call) and never makes a correct
+            # answer worse.
+            bare_concept = decompose.extract_bare_concept(standalone)
+            if bare_concept and bare_concept not in concepts:
+                concepts.append(bare_concept)
+
             # A question comparing two periods ("2017-2019" vs "2023-2025")
             # needs retrieval against every year actually relevant, not the
             # one year scope.resolve_year() picks for an ordinary question.
@@ -550,6 +564,16 @@ class Orchestrator:
         # Pure metadata (page/year/section) is answered straight from the
         # citation record, with no DB re-fetch and no LLM call at all.
         text = cite_explain.metadata_answer(citations, question)
+        if text is None:
+            years_by_variable = {
+                c.variable_name: await db.run_db(
+                    vector_store.years_for_variable, c.variable_name
+                )
+                for c in citations
+            }
+            text = cite_explain.year_availability_answer(
+                citations, question, years_by_variable
+            )
         if text is None:
             variables = await self._variables_of_citations(citations)
             text = await cite_explain.compose(

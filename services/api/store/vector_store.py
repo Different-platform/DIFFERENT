@@ -208,6 +208,25 @@ def search_sections(
         ]
 
 
+def years_for_variable(conn: psycopg.Connection, variable_name: str) -> list[int]:
+    """Every survey year this exact variable name appears in.
+
+    Backs a follow-up like "is that available every year from 2019 to
+    2023?" about a variable already cited — a question the system has every
+    fact needed to answer (each row already carries its own survey_year) but
+    previously had no path that looked it up, so it fell through to an LLM
+    reasoning step with none of this in its context and came back with "I'd
+    need to check the codebooks", a non-answer for something already known.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT survey_year FROM codebook_variables WHERE variable_name = %s "
+            "ORDER BY survey_year",
+            (variable_name,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
 def get_variable(
     conn: psycopg.Connection, survey_year: int, variable_name: str
 ) -> Hit | None:

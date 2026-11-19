@@ -77,6 +77,52 @@ async def test_a_single_concept_question_returns_itself_unchanged():
     assert result == ["How is BMI measured?"]
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What percentage of adults had health insurance coverage in 2022, "
+        "broken down by age group?",
+        "What percentage of adults below the poverty line had health "
+        "insurance coverage in 2022?",
+    ],
+)
+def test_breakdown_and_subgroup_filter_followups_look_compound(question):
+    """These are rewrite.to_standalone()'s own output shape for "break it
+    down by X" and "what about for Y" follow-ups — short, with none of the
+    original connective cue words, but still two concepts (the existing
+    measure, and the new breakdown/filter dimension). Retrieving them as one
+    embedding misses the second concept's variable entirely (confirmed
+    directly: neither AGEP_A nor RATCAT_A appears in the top 10 for the
+    combined sentence, while each ranks highly alone)."""
+    assert decompose.looks_compound(question)
+
+
+# --- extract_bare_concept ------------------------------------------------
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("Does NHIS ask about sleep duration?", "sleep duration"),
+        ("Does NHIS measure telehealth use?", "telehealth use"),
+        ("Is food insecurity measured in NHIS?", "food insecurity"),
+        ("Is there a variable for marital status in NHIS?", "marital status"),
+    ],
+)
+def test_extract_bare_concept_strips_the_measurement_wrapper(question, expected):
+    assert decompose.extract_bare_concept(question) == expected
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the average BMI in 2023?",
+        "How is food insecurity measured?",
+        "What about 2021?",
+    ],
+)
+def test_extract_bare_concept_returns_none_for_non_wrapper_questions(question):
+    assert decompose.extract_bare_concept(question) is None
+
+
 def test_prompt_tells_the_model_to_normalize_policy_framing():
     """Regression guard for the professor's telehealth-reimbursement question.
 
