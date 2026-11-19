@@ -18,7 +18,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
-import { API_BASE_URL } from "@/lib/differ/api-stream";
+import {
+  API_BASE_URL,
+  fetchConversationMessages,
+  fetchConversations,
+  type ConversationSummary,
+} from "@/lib/differ/api-stream";
 import { ask, USE_MOCK } from "@/lib/differ/ask";
 import { MOCK_CONVERSATIONS } from "@/lib/differ/mock-data";
 import type { Conversation, Message } from "@/lib/differ/types";
@@ -37,6 +42,18 @@ function createBlankConversation(defaultYear: number | null): Conversation {
     default_year: defaultYear,
     created_at: new Date().toISOString(),
     messages: [],
+    historyLoaded: true,
+  };
+}
+
+function conversationFromSummary(summary: ConversationSummary): Conversation {
+  return {
+    id: summary.id,
+    title: summary.title,
+    default_year: summary.default_year,
+    created_at: summary.created_at,
+    messages: [],
+    historyLoaded: false,
   };
 }
 
@@ -65,6 +82,27 @@ export function ConsolePage() {
     document.title = "DIFFER — Console";
   }, []);
 
+  // Earlier threads, listed under the blank one the page always opens on.
+  // Every turn is already saved server-side regardless of whether anything
+  // ever reads it back; this is what makes a refresh stop losing history.
+  useEffect(() => {
+    if (USE_MOCK) return;
+    let cancelled = false;
+    void fetchConversations().then((summaries) => {
+      if (cancelled || summaries.length === 0) return;
+      setConversations((prev) => [
+        ...prev,
+        ...summaries
+          .filter((s) => !prev.some((c) => c.id === s.id))
+          .map(conversationFromSummary),
+      ]);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const activeConversation = conversations.find((c) => c.id === activeId) ?? null;
   const lastMessageContent = activeConversation?.messages.at(-1)?.content;
   const messageCount = activeConversation?.messages.length;
@@ -89,6 +127,19 @@ export function ConsolePage() {
     const conv = conversations.find((c) => c.id === id);
     if (conv) setSelectedYear(conv.default_year);
     setMobileSidebarOpen(false);
+
+    // A history thread's messages are not fetched until it is actually
+    // opened — the sidebar only ever needed the title and date.
+    if (conv && conv.historyLoaded === false) {
+      void fetchConversationMessages(id).then((messages) => {
+        if (messages === null) return;
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === id ? { ...c, messages, historyLoaded: true } : c,
+          ),
+        );
+      });
+    }
   }
 
   function handleNewConversation() {
@@ -262,7 +313,11 @@ export function ConsolePage() {
         </Sheet>
 
         <main className="flex flex-1 flex-col overflow-hidden">
-          {!activeConversation || activeConversation.messages.length === 0 ? (
+          {activeConversation?.historyLoaded === false ? (
+            <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+              Loading conversation…
+            </div>
+          ) : !activeConversation || activeConversation.messages.length === 0 ? (
             <EmptyState onPick={(q) => void runQuestion(activeId, q)} />
           ) : (
             <div className="flex-1 overflow-y-auto px-4 py-6">

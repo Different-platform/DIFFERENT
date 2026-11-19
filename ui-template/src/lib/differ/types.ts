@@ -42,6 +42,14 @@ export interface Conversation {
   default_year: number | null;
   created_at: string;
   messages: Message[];
+  /**
+   * False for a conversation loaded from GET /api/conversations, whose
+   * messages have not been fetched yet — the sidebar lists history by
+   * title alone, so the full thread is only fetched once the researcher
+   * actually clicks into it. True for a conversation with nothing to
+   * lazy-load (a blank new one, or a mock demo thread).
+   */
+  historyLoaded?: boolean;
 }
 
 // Only years whose data is loaded in the backend. 2017-2018 are in the spec

@@ -219,6 +219,31 @@ def write_query_log(
         return cur.fetchone()[0]
 
 
+def list_messages(conn: psycopg.Connection, conversation_id: UUID | str) -> list[dict]:
+    """Every turn of one conversation, oldest first, for reloading a thread
+    in the UI after a page refresh — the full record (citations, verdict,
+    the SQL that ran) rather than load_history()'s role+content, which is
+    deliberately stripped down for rewrite prompts, not for re-rendering.
+
+    `result` (the actual numeric rows) is not stored and so cannot be
+    reconstructed here; the prose answer already states the number, and
+    re-running the SQL just to backfill a table the researcher already saw
+    once would be re-querying data on every page load for no new fact.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT id, role, content, citations, verdict, generated_sql,
+                   sql_verified, created_at
+            FROM messages
+            WHERE conversation_id = %s
+            ORDER BY created_at ASC, id ASC
+            """,
+            (str(conversation_id),),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
 def list_conversations(conn: psycopg.Connection, *, limit: int = 50) -> list[dict]:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
