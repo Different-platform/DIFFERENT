@@ -10,6 +10,7 @@
  * parses SSE frames directly.
  */
 
+import type { Citation, Message, SqlResult } from "./types";
 import type { StreamEvent } from "./mock-stream";
 
 // 127.0.0.1, not "localhost": browsers resolve localhost to IPv6 (::1) first,
@@ -131,6 +132,72 @@ export async function fetchHealth(): Promise<{
     const response = await fetch(`${API_BASE_URL}/api/health`);
     if (!response.ok) return null;
     return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  default_year: number | null;
+  created_at: string;
+  message_count: number;
+}
+
+/**
+ * Earlier threads, newest first, for the sidebar on page load.
+ *
+ * Before this existed, every page refresh started a blank conversation with
+ * no way back to anything asked a minute ago — the data was always being
+ * written to the database, just never read back.
+ */
+export async function fetchConversations(): Promise<ConversationSummary[]> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/conversations`);
+    if (!response.ok) return [];
+    const data = await response.json();
+    return data.conversations ?? [];
+  } catch {
+    return [];
+  }
+}
+
+interface StoredMessage {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  citations: Citation[];
+  verdict: Message["verdict"] | null;
+  sql: SqlResult | null;
+  created_at: string;
+}
+
+/**
+ * Every turn of one conversation, for re-rendering a thread picked from the
+ * sidebar. `result` (the numeric rows table) is not included — it was never
+ * stored, only the SQL and the prose answer that already states the number
+ * — so a reloaded assistant turn shows its citations, verdict, and SQL but
+ * not a separate result table.
+ */
+export async function fetchConversationMessages(
+  conversationId: string,
+): Promise<Message[] | null> {
+  try {
+    const response = await fetch(
+      `${API_BASE_URL}/api/conversations/${conversationId}/messages`,
+    );
+    if (!response.ok) return null;
+    const data: { messages: StoredMessage[] } = await response.json();
+    return data.messages.map((m) => ({
+      id: `db-${m.id}`,
+      role: m.role,
+      content: m.content,
+      citations: m.citations.length > 0 ? m.citations : undefined,
+      verdict: m.verdict ?? undefined,
+      sql: m.sql ?? undefined,
+      phase: "done",
+    }));
   } catch {
     return null;
   }

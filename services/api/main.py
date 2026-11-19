@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-from services.api.api.routes import chat, health, variables, years
+from services.api.api.routes import chat, conversations, health, variables, years
 from services.api.config import settings
 from services.api.middleware.rate_limit import RateLimiter, RateLimitMiddleware
 from services.api.middleware.shared_secret import SharedSecretMiddleware
@@ -156,6 +156,7 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(chat.router)
+app.include_router(conversations.router)
 app.include_router(variables.router)
 app.include_router(years.router)
 
