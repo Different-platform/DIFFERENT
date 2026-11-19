@@ -55,6 +55,45 @@ _PAGE_CUE = re.compile(r"\bwhat page\b", re.IGNORECASE)
 _YEAR_CUE = re.compile(r"\bwhat year\b", re.IGNORECASE)
 _SECTION_CUE = re.compile(r"\bwhat section\b", re.IGNORECASE)
 
+#: "Is that available every year from 2019 to 2023?" / "which years is this
+#: measured?" / "is it in all 5 years?" — a different shape from the single
+#: "what year" lookup above: this asks about a *range* or *every* year, not
+#: the one year the citation itself is from, so it needs an actual per-year
+#: lookup rather than restating the citation's own survey_year.
+_YEAR_AVAILABILITY_CUE = re.compile(
+    # "which/what years" (plural) asks about a range, same as it would for
+    # "every/each/all year(s)" — but bare singular "what year" must NOT
+    # match here, that is metadata_answer's single-year lookup's job.
+    r"\b(?:every|each|all)\s+years?\b|(?:which|what)\s+years\b|"
+    r"\byears?\s+(?:is|are)\s+(?:this|that|it|these|those)\s+"
+    r"(?:available|measured|asked|collected)\b|"
+    r"\bavailable\s+(?:in\s+)?(?:every|each|all)\s+year\b",
+    re.IGNORECASE,
+)
+
+
+def year_availability_answer(
+    citations: list[Citation], question: str, years_by_variable: dict[str, list[int]]
+) -> str | None:
+    """Answer "is this available every year?" straight from a DB lookup.
+
+    `years_by_variable` maps each cited variable's name to every survey year
+    it actually appears in (services.api.store.vector_store.years_for_variable),
+    fetched by the caller since this module does not touch the database
+    itself. Returns None when the question is not this shape, so the caller
+    falls through to the other metadata check and then the reasoning path.
+    """
+    if not citations or not _YEAR_AVAILABILITY_CUE.search(question):
+        return None
+    parts = []
+    for c in citations:
+        years = years_by_variable.get(c.variable_name, [])
+        if not years:
+            continue
+        span = ", ".join(str(y) for y in years)
+        parts.append(f"{c.variable_name} is available in: {span}.")
+    return " ".join(parts) if parts else None
+
 
 def metadata_answer(citations: list[Citation], question: str) -> str | None:
     """Answer a pure metadata question straight from the citation records.

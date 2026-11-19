@@ -35,6 +35,38 @@ CITATIONS = [
     )
 ]
 
+
+# --- year_availability_answer -------------------------------------------
+def test_year_availability_question_is_answered_from_the_db_lookup_not_guessed():
+    """"Is that available every year from 2019 to 2023?" has a real, known
+    answer (which survey_year rows exist for this variable name) that the
+    system has every fact needed for. Before this existed, the question fell
+    through to an LLM reasoning step given no year data at all, which came
+    back with "I'd need to check the codebooks" — a non-answer for something
+    already knowable from the database."""
+    years_by_variable = {"SLPHOURS_A": [2020, 2022]}
+    answer = cite_explain.year_availability_answer(
+        CITATIONS, "Is that available every year from 2019 to 2023?", years_by_variable
+    )
+    assert answer is None  # CITATIONS here cites RJWRKCLSSD_A, not SLPHOURS_A
+
+    citations = [
+        Citation(variable_name="SLPHOURS_A", section="Sleep", page=516, survey_year=2020)
+    ]
+    answer = cite_explain.year_availability_answer(
+        citations, "Is that available every year from 2019 to 2023?", years_by_variable
+    )
+    assert answer == "SLPHOURS_A is available in: 2020, 2022."
+
+
+def test_year_availability_cue_does_not_fire_on_the_single_year_question():
+    """"What year is that from" is the existing single-year metadata_answer's
+    job; this must not also claim it, or the two could disagree."""
+    answer = cite_explain.year_availability_answer(
+        CITATIONS, "What year is that from?", {"RJWRKCLSSD_A": [2020]}
+    )
+    assert answer is None
+
 GOOD = (
     "RJWRKCLSSD_A does not count because it only records physical distance "
     "from coworkers during the pandemic, not whether someone feels alone or "

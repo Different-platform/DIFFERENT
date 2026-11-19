@@ -157,6 +157,9 @@ def pipeline(monkeypatch):
             name = args[1]
             state["fetched"].append(name)
             return state["fetchable"].get(name)
+        if operation is vector_store.years_for_variable:
+            name = args[0]
+            return state.get("years_by_variable", {}).get(name, [])
         if operation is readonly_store.execute:
             order.append("execute")
             return state["sql_result"]
