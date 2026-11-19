@@ -30,8 +30,25 @@ class Embedder:
         if self._model is None:
             # Imported here so that merely importing this module does not pay
             # the torch import cost.
+            import torch
             from sentence_transformers import SentenceTransformer
 
+            # PyTorch defaults its intra-op thread pool to the number of
+            # logical CPUs the OS reports, which inside a resource-limited
+            # container is the HOST's core count, not the container's actual
+            # cgroup CPU quota. On a constrained container this makes every
+            # single encode() call spin up far more math threads than there
+            # is real CPU to run them on — fine in isolation (the OS still
+            # gets there eventually), but under any concurrency (several
+            # requests, or several decomposed concepts in one request) the
+            # threads from multiple calls contend for the same sliver of CPU
+            # and encode() latency goes from tens of milliseconds to 20-30+
+            # seconds. Measured directly in production: embed=28797ms for a
+            # single question, confirmed via per-stage timing added for this
+            # investigation. One thread is correct for this workload anyway
+            # — a single short sentence, encoded one at a time, has nothing
+            # for extra intra-op threads to parallelize.
+            torch.set_num_threads(1)
             self._model = SentenceTransformer(self.model_name)
         return self._model
 
