@@ -17,7 +17,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # image below; a fresh download on every restart is slow, rate-limited,
     # and a dependency on a third party being up.
     HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1
+    TRANSFORMERS_OFFLINE=1 \
+    # PyTorch/MKL/tokenizers each default their own thread pool to the
+    # HOST's CPU count, not this container's actual quota. On a constrained
+    # container that oversubscribes CPU badly enough to turn a ~50ms encode
+    # call into 20-30+ seconds under any concurrency (measured in
+    # production). embedder.py also pins torch's thread count at runtime;
+    # these cover MKL and the tokenizers Rust extension, which torch's own
+    # call does not reach.
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    TOKENIZERS_PARALLELISM=false
 
 WORKDIR /app
 
